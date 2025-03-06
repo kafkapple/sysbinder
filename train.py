@@ -23,13 +23,13 @@ from utils import linear_warmup, cosine_anneal
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--seed', type=int, default=0)
-parser.add_argument('--batch_size', type=int, default=40)
+parser.add_argument('--batch_size', type=int, default=16)
 parser.add_argument('--num_workers', type=int, default=4)
 parser.add_argument('--image_size', type=int, default=128)
 parser.add_argument('--image_channels', type=int, default=3)
 
 parser.add_argument('--checkpoint_path', default='checkpoint.pt.tar')
-parser.add_argument('--data_path', default='data/*.png')
+parser.add_argument('--data_path', default='./data/clevr-easy/train/*.png') 
 parser.add_argument('--log_path', default='logs/')
 
 parser.add_argument('--lr_dvae', type=float, default=3e-4)
