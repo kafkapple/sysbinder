@@ -94,7 +94,7 @@ class TextEmbeddingModel:
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--seed', type=int, default=0)
-parser.add_argument('--batch_size', type=int, default=16)
+parser.add_argument('--batch_size', type=int, default=64)
 parser.add_argument('--num_workers', type=int, default=4)
 parser.add_argument('--image_size', type=int, default=128)
 parser.add_argument('--image_channels', type=int, default=3)
@@ -109,7 +109,7 @@ parser.add_argument('--lr_dec', type=float, default=3e-4)
 parser.add_argument('--lr_warmup_steps', type=int, default=30000)
 parser.add_argument('--lr_half_life', type=int, default=250000)
 parser.add_argument('--clip', type=float, default=0.05)
-parser.add_argument('--epochs', type=int, default=3)
+parser.add_argument('--epochs', type=int, default=10)
 
 parser.add_argument('--num_iterations', type=int, default=3)
 parser.add_argument('--num_slots', type=int, default=4)
@@ -304,19 +304,55 @@ else:
         phase='val'
     )
 
-# Add sample limitation for debug mode
+# Modify debug mode settings
 if args.debug:
-    args.batch_size = 8  # Use smaller batch size in debug mode
-    debug_samples = 32  # Number of debug samples
+    args.batch_size = 16  # Increase batch size for better class representation
+    debug_samples = 128  # Increase number of debug samples
     
-    # Use subset of data in debug mode
+    # Ensure balanced sampling across emotion classes
+    train_data_list = []
+    val_data_list = []
+    emotion_classes = ["joy", "fear", "anger", "sadness", "disgust", "shame", "guilt"]
+    samples_per_class = debug_samples // len(emotion_classes)
+    
+    for emotion_idx in range(len(emotion_classes)):
+        # Find indices for each emotion class
+        if isinstance(train_dataset, torch.utils.data.Subset):
+            base_dataset = train_dataset.dataset
+            train_indices = train_dataset.indices
+            # Get all samples first
+            all_samples = [base_dataset[i] for i in train_indices]
+            # Extract emotion labels
+            emotion_labels = torch.stack([sample['emotion'] for sample in all_samples])
+            emotion_mask = torch.argmax(emotion_labels, dim=1) == emotion_idx
+            class_indices = torch.where(emotion_mask)[0]
+        else:
+            # Get all samples
+            all_samples = [train_dataset[i] for i in range(len(train_dataset))]
+            # Extract emotion labels
+            emotion_labels = torch.stack([sample['emotion'] for sample in all_samples])
+            emotion_mask = torch.argmax(emotion_labels, dim=1) == emotion_idx
+            class_indices = torch.where(emotion_mask)[0]
+        
+        # Randomly sample from each class
+        if len(class_indices) > 0:
+            selected_indices = np.random.choice(
+                class_indices.cpu().numpy(), 
+                size=min(samples_per_class, len(class_indices)), 
+                replace=False
+            )
+            train_data_list.extend(selected_indices)
+    
+    # Create new subset with balanced samples
     train_dataset = torch.utils.data.Subset(
-        train_dataset, 
-        indices=range(min(debug_samples, len(train_dataset)))
+        train_dataset if not isinstance(train_dataset, torch.utils.data.Subset) else train_dataset.dataset,
+        indices=train_data_list
     )
+    
+    # Similar process for validation set
     val_dataset = torch.utils.data.Subset(
-        val_dataset,
-        indices=range(min(debug_samples // 2, len(val_dataset)))  # Half for validation
+        val_dataset if not isinstance(val_dataset, torch.utils.data.Subset) else val_dataset.dataset,
+        indices=range(min(debug_samples // 2, len(val_dataset)))
     )
 
 train_sampler = None
@@ -405,7 +441,9 @@ class_visualization_data = {
     'texts': [],
     'slots': [],
     'attns': [],
-    'labels': []
+    'labels': [],
+    'recon': [],
+    'original': []
 }
 
 # Training loop
@@ -463,7 +501,8 @@ for epoch in range(start_epoch, args.epochs):
         (recon_dvae, cross_entropy, mse, attns) = model(images, tau)
 
         if args.use_dp:
-            mse = mse.mean()
+            # Normalize MSE by the dimension size
+            mse = mse.mean() / (args.slot_size * args.num_slots)
             cross_entropy = cross_entropy.mean()
 
         loss = mse + cross_entropy
@@ -476,13 +515,20 @@ for epoch in range(start_epoch, args.epochs):
         
         with torch.no_grad():
             if batch_idx % log_interval == 0:
+                # Calculate reconstruction similarity
+                cos_sim = F.cosine_similarity(images.view(images.size(0), -1), 
+                                           recon_dvae.view(recon_dvae.size(0), -1), 
+                                           dim=1).mean()
+                
                 print(f'\n[Epoch {epoch+1}/{args.epochs}] [{batch_idx:,}/{train_epoch_size:,}]')
                 print(f'Loss: {loss.item():.4f} (MSE: {mse.item():.4f}, CE: {cross_entropy.item():.4f})')
+                print(f'Reconstruction Similarity: {cos_sim.item():.4f}')
                 print(f'Learning rate: {optimizer.param_groups[0]["lr"]:.2e}')
                 
                 writer.add_scalar('TRAIN/loss', loss.item(), global_step)
                 writer.add_scalar('TRAIN/cross_entropy', cross_entropy.item(), global_step)
                 writer.add_scalar('TRAIN/mse', mse.item(), global_step)
+                writer.add_scalar('TRAIN/reconstruction_similarity', cos_sim.item(), global_step)
 
                 writer.add_scalar('TRAIN/tau', tau, global_step)
                 writer.add_scalar('TRAIN/lr_dvae', optimizer.param_groups[0]['lr'], global_step)
@@ -499,94 +545,256 @@ for epoch in range(start_epoch, args.epochs):
                     emotion_idx = torch.argmax(emotion_labels[sample_idx]).item()
                     emotion_label = emotion_classes[emotion_idx]
                     
-                    # Visualize only if emotion class hasn't been visualized or in debug mode
-                    if emotion_label not in last_visualized_emotions or args.debug:
+                    # Collect data for class-wise comparison if emotion not yet collected
+                    if emotion_label not in [label for label in class_visualization_data['labels']]:
                         slots_data = (model.module if args.use_dp else model).text_encoder.sysbinder(
                             text_embeddings[sample_idx].unsqueeze(0).unsqueeze(0)
                         )[0]
                         
-                        # Collect data for class-wise comparison
-                        if emotion_label not in [label for label in class_visualization_data['labels']]:
-                            class_visualization_data['texts'].append(text_data[sample_idx])
-                            class_visualization_data['slots'].append(slots_data)
-                            class_visualization_data['attns'].append(attns[sample_idx])
-                            class_visualization_data['labels'].append(emotion_label)
-                        
-                        # Execute debug print conditionally
+                        # Add detailed debug prints
                         if args.debug_print:
-                            print(f"Processing emotion: {emotion_label}")
-                            print(f"Text: {text_data[sample_idx]}")
-                            print(f"Attention weights shape: {attns[sample_idx].shape}")
-                            print(f"Slots shape: {slots_data.shape}")
+                            print("\n=== Detailed Shape Analysis ===")
+                            print(f"1. Original text_embeddings shape: {text_embeddings[sample_idx].shape}")
+                            print(f"2. Input to sysbinder shape: {text_embeddings[sample_idx].unsqueeze(0).unsqueeze(0).shape}")
+                            print(f"3. Slots data shape: {slots_data.shape}")
+                            print(f"4. Slots data total size: {slots_data.numel()}")
+                            print(f"5. Expected reshape size: ({args.slot_size // (args.slot_size // args.num_blocks)}, {args.slot_size // args.num_blocks})")
+                            print("============================\n")
                         
-                        log_text_visualizations(
-                            writer=writer,
-                            epoch=epoch * len(train_loader) + batch_idx,
-                            text=text_data[sample_idx],
-                            text_embedding=text_embeddings[sample_idx],
-                            slots=slots_data,
-                            attns=attns[sample_idx].unsqueeze(0),
-                            reconstructed_embedding=recon_dvae[sample_idx],
-                            emotion_label=emotion_label,
-                            num_blocks=args.num_blocks,
-                            tag_prefix='train',
-                            debug=args.debug_print
-                        )
-                        
-                        last_visualized_emotions.add(emotion_label)
+                        class_visualization_data['texts'].append(text_data[sample_idx])
+                        class_visualization_data['slots'].append(slots_data)
+                        class_visualization_data['attns'].append(attns[sample_idx])
+                        class_visualization_data['labels'].append(emotion_label)
+                        class_visualization_data['recon'].append(recon_dvae[sample_idx])
+                        class_visualization_data['original'].append(text_embeddings[sample_idx])
                     
-                    # If all emotion classes have been visualized, create class-wise comparison visualization
-                    if len(last_visualized_emotions) == len(emotion_classes):
-                        # Class-wise comparison visualization
-                        comparison_fig = visualize_class_comparison(
-                            texts=class_visualization_data['texts'],
-                            slots_list=class_visualization_data['slots'],
-                            attns_list=class_visualization_data['attns'],
-                            emotion_labels=class_visualization_data['labels'],
-                            num_blocks=args.num_blocks
-                        )
-                        writer.add_figure('train/class_comparison', comparison_fig, epoch)
-                        
-                        # Emotion class relationship analysis
-                        attn_sim, block_sim, emotion_dist = analyze_emotion_relationships(
-                            slots_list=class_visualization_data['slots'],
-                            attns_list=class_visualization_data['attns'],
-                            emotion_labels=class_visualization_data['labels'],
-                            num_blocks=args.num_blocks
-                        )
-                        
-                        # Relationship visualization
-                        relationship_fig = visualize_emotion_relationships(
-                            attn_sim, block_sim, emotion_dist,
-                            class_visualization_data['labels']
-                        )
-                        writer.add_figure('train/emotion_relationships', relationship_fig, epoch)
-                        
-                        # Record quantitative metrics
-                        for i, emotion1 in enumerate(class_visualization_data['labels']):
-                            for j, emotion2 in enumerate(class_visualization_data['labels']):
-                                if i < j:  # Avoid duplicates
-                                    writer.add_scalar(
-                                        f'relationships/attention_similarity/{emotion1}_vs_{emotion2}',
-                                        attn_sim[i,j], epoch
-                                    )
-                                    writer.add_scalar(
-                                        f'relationships/block_similarity/{emotion1}_vs_{emotion2}',
-                                        block_sim[i,j], epoch
-                                    )
-                                    writer.add_scalar(
-                                        f'relationships/emotion_distance/{emotion1}_vs_{emotion2}',
-                                        emotion_dist[i,j], epoch
-                                    )
-                        
-                        # Data initialization
-                        last_visualized_emotions.clear()
-                        class_visualization_data = {
-                            'texts': [],
-                            'slots': [],
-                            'attns': [],
-                            'labels': []
-                        }
+                    # Execute debug print conditionally
+                    if args.debug_print:
+                        print(f"Processing emotion: {emotion_label}")
+                        print(f"Text: {text_data[sample_idx]}")
+                        print(f"Attention weights shape: {attns[sample_idx].shape}")
+                        print(f"Slots shape: {slots_data.shape}")
+                
+                # If all emotion classes have been visualized, create analysis plots
+                if len(class_visualization_data['labels']) == len(emotion_classes):
+                    # Calculate reconstruction similarity per class
+                    recon_similarities = []
+                    recon_errors = []
+                    
+                    # Block slot heatmaps per class
+                    for emotion_idx, emotion in enumerate(emotion_classes):
+                        emotion_indices = [i for i, label in enumerate(class_visualization_data['labels']) if label == emotion]
+                        if emotion_indices:
+                            # Reconstruction similarity 계산
+                            orig = torch.stack([class_visualization_data['original'][i] for i in emotion_indices])
+                            recon = torch.stack([class_visualization_data['recon'][i] for i in emotion_indices])
+                            
+                            # Calculate cosine similarity
+                            similarities = F.cosine_similarity(orig, recon, dim=1)
+                            recon_similarities.append(similarities.mean().item())
+                            recon_errors.append(similarities.std().item())
+                            
+                            # Block slot heatmap for each class
+                            slots = torch.stack([class_visualization_data['slots'][i] for i in emotion_indices])
+                            mean_slots = slots.mean(dim=0)  # Average over samples
+                            
+                            # Debug print for slots shape
+                            if args.debug_print:
+                                print("\n=== Detailed Shape Analysis ===")
+                                print(f"1. Original slots shape: {slots.shape}")
+                                print(f"2. Mean slots shape: {mean_slots.shape}")
+                                print(f"3. Expected: (num_slots={args.num_slots}, slot_size={args.slot_size})")
+                                print("============================\n")
+                            
+                            # Reshape for visualization: divide slot_size into num_blocks segments
+                            features_per_block = args.slot_size // args.num_blocks
+                            mean_slots_reshaped = mean_slots.reshape(args.num_slots, args.num_blocks, features_per_block)
+                            mean_slots_activity = mean_slots_reshaped.mean(dim=-1)  # Average over features in each block
+                            
+                            if args.debug_print:
+                                print(f"4. Reshaped for visualization: {mean_slots_reshaped.shape}")
+                                print(f"5. Final activity map: {mean_slots_activity.shape}")
+                            
+                            # Create comprehensive visualization for this emotion
+                            fig = plt.figure(figsize=(20, 12))
+                            gs = plt.GridSpec(2, 3, figure=fig)
+                            
+                            # 1. Attention Slot Heatmap
+                            ax1 = fig.add_subplot(gs[0, 0])
+                            attention_map = attns[emotion_indices[0]].mean(dim=0).cpu().numpy()
+                            attention_map = attention_map.reshape(-1, 1)  # Reshape to (num_slots, 1)
+                            # Normalize attention map to 0-1 scale
+                            attention_map = (attention_map - attention_map.min()) / (attention_map.max() - attention_map.min() + 1e-8)
+                            sns.heatmap(attention_map, 
+                                      cmap='viridis',
+                                      xticklabels=['Attention'],
+                                      yticklabels=range(1, args.num_slots + 1),
+                                      ax=ax1)
+                            ax1.set_title(f'Attention Distribution - {emotion}')
+                            
+                            # 2. Block Slot Heatmap with feature averages
+                            ax2 = fig.add_subplot(gs[0, 1:])
+                            # Normalize mean_slots to 0-1 scale
+                            mean_slots_np = mean_slots_activity.cpu().numpy()
+                            mean_slots_np = (mean_slots_np - mean_slots_np.min()) / (mean_slots_np.max() - mean_slots_np.min() + 1e-8)
+                            sns.heatmap(mean_slots_np,
+                                      cmap='viridis',
+                                      xticklabels=range(1, args.num_blocks + 1),
+                                      yticklabels=range(1, args.num_slots + 1),
+                                      ax=ax2)
+                            ax2.set_title(f'Block-Slot Activity - {emotion}')
+                            ax2.set_xlabel('Blocks')
+                            ax2.set_ylabel('Slots')
+                            
+                            # 3. Slot-wise Block Activities with Error Bars
+                            ax3 = fig.add_subplot(gs[1, :2])
+                            slot_means = mean_slots_activity.cpu().numpy()
+                            
+                            # Calculate std dev correctly
+                            slots_reshaped = slots.reshape(-1, args.num_slots, args.num_blocks, args.slot_size // args.num_blocks)
+                            slot_stds = slots_reshaped.std(dim=0).mean(dim=-1).cpu().numpy()  # Average std dev over samples and features
+                            
+                            for slot_idx in range(args.num_slots):
+                                ax3.errorbar(range(1, args.num_blocks + 1),
+                                           slot_means[slot_idx],
+                                           yerr=slot_stds[slot_idx],
+                                           label=f'Slot {slot_idx + 1}',
+                                           marker='o',
+                                           capsize=5)
+                            ax3.set_xlabel('Blocks')
+                            ax3.set_ylabel('Activity')
+                            ax3.set_title(f'Slot-wise Block Activities - {emotion}')
+                            ax3.legend()
+                            
+                            # 4. Sample Texts and Information
+                            ax4 = fig.add_subplot(gs[1, 2])
+                            ax4.axis('off')
+                            sample_texts = class_visualization_data['texts'][:3]  # Show up to 3 examples
+                            info_text = f"Emotion: {emotion}\n\nExample texts:\n"
+                            for i, text in enumerate(sample_texts, 1):
+                                info_text += f"{i}. {text[:100]}...\n"  # Truncate long texts
+                            ax4.text(0, 1, info_text, 
+                                   verticalalignment='top',
+                                   wrap=True,
+                                   fontsize=8)
+                            
+                            plt.tight_layout()
+                            writer.add_figure(f'train/detailed_analysis/{emotion}', fig, epoch)
+                            plt.close()
+                            
+                            # Create individual plots for specific analyses
+                            # Block slot heatmap (simplified version for overview)
+                            fig, ax = plt.subplots(figsize=(12, 4))
+                            sns.heatmap(mean_slots_activity.cpu().numpy(),
+                                      cmap='viridis',
+                                      xticklabels=range(1, args.num_blocks + 1),
+                                      yticklabels=range(1, args.num_slots + 1))
+                            plt.title(f'Block Slot Heatmap - {emotion}')
+                            plt.xlabel('Blocks')
+                            plt.ylabel('Slots')
+                            writer.add_figure(f'train/block_slot_heatmap/{emotion}', fig, epoch)
+                            plt.close()
+                    
+                    # Create combined visualization for all emotions
+                    fig = plt.figure(figsize=(20, 15))
+                    gs = plt.GridSpec(3, 3, figure=fig)
+                    
+                    # Plot individual class heatmaps
+                    for emotion_idx, emotion in enumerate(emotion_classes):
+                        ax = fig.add_subplot(gs[emotion_idx // 3, emotion_idx % 3])
+                        emotion_indices = [i for i, label in enumerate(class_visualization_data['labels']) if label == emotion]
+                        if emotion_indices:
+                            slots = torch.stack([class_visualization_data['slots'][i] for i in emotion_indices])
+                            mean_slots = slots.mean(dim=0)
+                            slot_feature_size = args.slot_size // args.num_blocks
+                            mean_slots = mean_slots.reshape(args.num_slots, args.num_blocks, slot_feature_size)
+                            mean_slots = mean_slots.mean(dim=-1)
+                            
+                            sns.heatmap(mean_slots.cpu().numpy(),
+                                      cmap='viridis',
+                                      xticklabels=range(1, args.num_blocks + 1),
+                                      yticklabels=range(1, args.num_slots + 1),
+                                      ax=ax)
+                            ax.set_title(f'{emotion}')
+                            ax.set_xlabel('Blocks')
+                            ax.set_ylabel('Slots')
+                    
+                    # Add overall average in the last subplot
+                    ax = fig.add_subplot(gs[2, 2])
+                    all_slots = torch.stack([s for s in class_visualization_data['slots']])
+                    mean_all_slots = all_slots.mean(dim=0)
+                    slot_feature_size = args.slot_size // args.num_blocks
+                    mean_all_slots = mean_all_slots.reshape(args.num_slots, args.num_blocks, slot_feature_size)
+                    mean_all_slots = mean_all_slots.mean(dim=-1)
+                    
+                    sns.heatmap(mean_all_slots.cpu().numpy(),
+                              cmap='viridis',
+                              xticklabels=range(1, args.num_blocks + 1),
+                              yticklabels=range(1, args.num_slots + 1),
+                              ax=ax)
+                    ax.set_title('All Classes Average')
+                    ax.set_xlabel('Blocks')
+                    ax.set_ylabel('Slots')
+                    
+                    plt.tight_layout()
+                    writer.add_figure('train/block_slot_heatmap/all_classes', fig, epoch)
+                    plt.close()
+                    
+                    # Create reconstruction similarity plot
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    x = np.arange(len(emotion_classes))
+                    ax.bar(x, recon_similarities, yerr=recon_errors, capsize=5)
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(emotion_classes, rotation=45)
+                    ax.set_ylabel('Reconstruction Similarity')
+                    ax.set_title('Reconstruction Quality by Emotion Class')
+                    plt.tight_layout()
+                    
+                    # Log the plot
+                    writer.add_figure('train/reconstruction_similarity', fig, epoch)
+                    plt.close()
+                    
+                    # Emotion class relationship analysis
+                    attn_sim, block_sim, emotion_dist = analyze_emotion_relationships(
+                        slots_list=class_visualization_data['slots'],
+                        attns_list=class_visualization_data['attns'],
+                        emotion_labels=class_visualization_data['labels'],
+                        num_blocks=args.num_blocks
+                    )
+                    
+                    # Relationship visualization
+                    relationship_fig = visualize_emotion_relationships(
+                        attn_sim, block_sim, emotion_dist,
+                        class_visualization_data['labels']
+                    )
+                    writer.add_figure('train/emotion_relationships', relationship_fig, epoch)
+                    
+                    # Record quantitative metrics
+                    for i, emotion1 in enumerate(class_visualization_data['labels']):
+                        for j, emotion2 in enumerate(class_visualization_data['labels']):
+                            if i < j:  # Avoid duplicates
+                                writer.add_scalar(
+                                    f'relationships/attention_similarity/{emotion1}_vs_{emotion2}',
+                                    attn_sim[i,j], epoch
+                                )
+                                writer.add_scalar(
+                                    f'relationships/block_similarity/{emotion1}_vs_{emotion2}',
+                                    block_sim[i,j], epoch
+                                )
+                                writer.add_scalar(
+                                    f'relationships/emotion_distance/{emotion1}_vs_{emotion2}',
+                                    emotion_dist[i,j], epoch
+                                )
+                    
+                    # Data initialization
+                    class_visualization_data = {
+                        'texts': [],
+                        'slots': [],
+                        'attns': [],
+                        'labels': [],
+                        'recon': [],
+                        'original': []
+                    }
             else:
                 # If image data, keep existing visualization
                 writer.add_image('train/original', vutils.make_grid(images[:8]), epoch * len(train_loader) + batch_idx)
