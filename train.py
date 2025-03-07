@@ -501,9 +501,37 @@ for epoch in range(start_epoch, args.epochs):
         (recon_dvae, cross_entropy, mse, attns) = model(images, tau)
 
         if args.use_dp:
-            # Normalize MSE by the dimension size
-            mse = mse.mean() / (args.slot_size * args.num_slots)
-            cross_entropy = cross_entropy.mean()
+            if args.data_type == 'isear':
+                # 1. L2 정규화를 통한 임베딩 정규화
+                images_norm = F.normalize(images.view(images.size(0), -1), p=2, dim=1)
+                recon_norm = F.normalize(recon_dvae.view(recon_dvae.size(0), -1), p=2, dim=1)
+                
+                # 2. Cosine Similarity Loss
+                cos_sim = F.cosine_similarity(images_norm, recon_norm, dim=1)
+                cos_loss = 1 - cos_sim.mean()  # 1에서 빼서 minimize하도록
+                
+                # 3. Feature-wise MSE with scaling
+                feature_scales = images.abs().mean(dim=0, keepdim=True)  # 각 feature의 scale 계산
+                scaled_mse = ((images - recon_dvae).pow(2) / (feature_scales + 1e-6)).mean()
+                
+                # 4. Combined Loss
+                mse = (scaled_mse + cos_loss) * 10.0  # Scale up to match CE scale
+                cross_entropy = cross_entropy.mean()
+                
+                # Debug prints
+                if batch_idx % log_interval == 0 and args.debug_print:
+                    print("\n=== Loss Components Analysis ===")
+                    print(f"Cosine Loss: {cos_loss.item():.4f}")
+                    print(f"Scaled MSE: {scaled_mse.item():.4f}")
+                    print(f"Combined MSE: {mse.item():.4f}")
+                    print(f"Cross Entropy: {cross_entropy.item():.4f}")
+                    print(f"Cosine Similarity: {cos_sim.mean().item():.4f}")
+                    print(f"Feature Scales - Mean: {feature_scales.mean().item():.4f}, Max: {feature_scales.max().item():.4f}")
+                    print("============================\n")
+            else:
+                # Image data: 기존 방식 유지
+                mse = mse.mean()
+                cross_entropy = cross_entropy.mean()
 
         loss = mse + cross_entropy
         
@@ -520,14 +548,20 @@ for epoch in range(start_epoch, args.epochs):
                                            recon_dvae.view(recon_dvae.size(0), -1), 
                                            dim=1).mean()
                 
+                # Calculate L1 loss for additional monitoring
+                l1_loss = F.l1_loss(images, recon_dvae)
+                
                 print(f'\n[Epoch {epoch+1}/{args.epochs}] [{batch_idx:,}/{train_epoch_size:,}]')
                 print(f'Loss: {loss.item():.4f} (MSE: {mse.item():.4f}, CE: {cross_entropy.item():.4f})')
-                print(f'Reconstruction Similarity: {cos_sim.item():.4f}')
+                print(f'Additional Metrics:')
+                print(f'- L1 Loss: {l1_loss.item():.4f}')
+                print(f'- Cosine Similarity: {cos_sim.item():.4f}')
                 print(f'Learning rate: {optimizer.param_groups[0]["lr"]:.2e}')
                 
                 writer.add_scalar('TRAIN/loss', loss.item(), global_step)
                 writer.add_scalar('TRAIN/cross_entropy', cross_entropy.item(), global_step)
                 writer.add_scalar('TRAIN/mse', mse.item(), global_step)
+                writer.add_scalar('TRAIN/l1_loss', l1_loss.item(), global_step)
                 writer.add_scalar('TRAIN/reconstruction_similarity', cos_sim.item(), global_step)
 
                 writer.add_scalar('TRAIN/tau', tau, global_step)
@@ -637,14 +671,30 @@ for epoch in range(start_epoch, args.epochs):
                             # Normalize mean_slots to 0-1 scale
                             mean_slots_np = mean_slots_activity.cpu().numpy()
                             mean_slots_np = (mean_slots_np - mean_slots_np.min()) / (mean_slots_np.max() - mean_slots_np.min() + 1e-8)
-                            sns.heatmap(mean_slots_np,
-                                      cmap='viridis',
-                                      xticklabels=range(1, args.num_blocks + 1),
-                                      yticklabels=range(1, args.num_slots + 1),
-                                      ax=ax2)
-                            ax2.set_title(f'Block-Slot Activity - {emotion}')
-                            ax2.set_xlabel('Blocks')
-                            ax2.set_ylabel('Slots')
+                            
+                            # Use distinct colors for each slot
+                            colors = plt.cm.Set3(np.linspace(0, 1, args.num_slots))
+                            slot_heatmaps = []
+                            
+                            for slot_idx in range(args.num_slots):
+                                slot_data = mean_slots_np[slot_idx:slot_idx+1, :]
+                                heatmap = ax2.imshow(slot_data, 
+                                                   aspect='auto',
+                                                   extent=[0.5, args.num_blocks + 0.5, slot_idx + 0.5, slot_idx + 1.5],
+                                                   cmap=plt.cm.viridis,
+                                                   alpha=0.7)
+                                slot_heatmaps.append(heatmap)
+                            
+                            # Add colorbar
+                            plt.colorbar(slot_heatmaps[-1], ax=ax2, label='Normalized Activity')
+                            
+                            # Customize appearance
+                            ax2.set_xticks(range(1, args.num_blocks + 1))
+                            ax2.set_yticks(range(1, args.num_slots + 1))
+                            ax2.grid(True, color='white', linestyle='-', linewidth=0.5)
+                            ax2.set_title(f'Block-Slot Activity - {emotion}', pad=20)
+                            ax2.set_xlabel('Blocks', labelpad=10)
+                            ax2.set_ylabel('Slots', labelpad=10)
                             
                             # 3. Slot-wise Block Activities with Error Bars
                             ax3 = fig.add_subplot(gs[1, :2])
@@ -652,19 +702,32 @@ for epoch in range(start_epoch, args.epochs):
                             
                             # Calculate std dev correctly
                             slots_reshaped = slots.reshape(-1, args.num_slots, args.num_blocks, args.slot_size // args.num_blocks)
-                            slot_stds = slots_reshaped.std(dim=0).mean(dim=-1).cpu().numpy()  # Average std dev over samples and features
+                            slot_stds = slots_reshaped.std(dim=0).mean(dim=-1).cpu().numpy()
                             
+                            # Plot with enhanced visibility
                             for slot_idx in range(args.num_slots):
                                 ax3.errorbar(range(1, args.num_blocks + 1),
                                            slot_means[slot_idx],
                                            yerr=slot_stds[slot_idx],
                                            label=f'Slot {slot_idx + 1}',
+                                           color=colors[slot_idx],
                                            marker='o',
-                                           capsize=5)
-                            ax3.set_xlabel('Blocks')
-                            ax3.set_ylabel('Activity')
-                            ax3.set_title(f'Slot-wise Block Activities - {emotion}')
-                            ax3.legend()
+                                           markersize=8,
+                                           capsize=5,
+                                           capthick=2,
+                                           elinewidth=2,
+                                           linewidth=2)
+                            
+                            # Enhance plot appearance
+                            ax3.grid(True, linestyle='--', alpha=0.7)
+                            ax3.set_xlabel('Blocks', fontsize=10)
+                            ax3.set_ylabel('Activity', fontsize=10)
+                            ax3.set_title(f'Slot-wise Block Activities - {emotion}', pad=20)
+                            ax3.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                            
+                            # Add error bar explanation in the legend
+                            ax3.plot([], [], color='black', label='Error bars: ±1 std dev')
+                            ax3.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
                             
                             # 4. Sample Texts and Information
                             ax4 = fig.add_subplot(gs[1, 2])
