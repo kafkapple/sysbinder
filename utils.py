@@ -300,12 +300,12 @@ class OneHotDictionary(nn.Module):
 
 
 def wrap_text(text, width=50):
-    """텍스트를 지정된 너비에서 줄바꿈"""
+    """Wrap text at specified width"""
     return textwrap.fill(text, width=width)
 
 
 def normalize_values(values, min_val=None, max_val=None):
-    """값을 0-1 사이로 정규화"""
+    """Normalize values to 0-1 range"""
     if min_val is None:
         min_val = np.min(values)
     if max_val is None:
@@ -322,13 +322,20 @@ def visualize_text_attention(text, text_embedding, slots, attns, emotion_label=N
     """
     Text data attention visualization with proper block structure and emotion class
     """
+    # Set font for visualization
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+    
     B, num_slots, slot_size = slots.size()
     
-    # Figure 생성
+    # Create figure with adjusted ratio
     fig = plt.figure(figsize=fig_size)
-    gs = plt.GridSpec(2, 2, width_ratios=[1, 2], height_ratios=[1, 1])
+    gs = plt.GridSpec(2, 2, width_ratios=[1, 1.5], height_ratios=[1, 1])
     
-    # 1. Attention weights 시각화 (4 slots)
+    # Add information to title
+    fig.suptitle(f'Text Attention Analysis\nEmotion: {emotion_label or "N/A"} | Slots: {num_slots} | Blocks: {num_blocks}', 
+                fontsize=12, y=0.95)
+    
+    # 1. Attention weights visualization
     ax1 = plt.subplot(gs[0, 0])
     attn_weights = attns.detach().cpu().numpy()
     if len(attn_weights.shape) == 3:
@@ -351,20 +358,18 @@ def visualize_text_attention(text, text_embedding, slots, attns, emotion_label=N
         vmax=1 if normalize else None,
         ax=ax1
     )
-    ax1.set_title('Slot Attention Weights' + (f' ({emotion_label})' if emotion_label else ''))
+    ax1.set_title(f'Slot Attention Weights\n{"(Normalized)" if normalize else ""}')
     
-    # 2. 각 슬롯의 block 값 분포 시각화 (4 slots x 8 blocks)
+    # 2. Block value distribution visualization - wider ratio
     ax2 = plt.subplot(gs[0, 1])
     slot_values = slots.detach().cpu().numpy()
     
-    # 실제 num_blocks에 맞게 reshape
     block_size = slot_size // num_blocks
     reshaped_values = slot_values[0].reshape(num_slots, num_blocks, -1)
     block_means = np.mean(reshaped_values, axis=2)
     block_stds = np.std(reshaped_values, axis=2)
     
-    # 값의 스케일 조정
-    scale_factor = 1e6  # 10^6으로 스케일 조정
+    scale_factor = 1e6
     scaled_means = block_means * scale_factor
     
     if normalize:
@@ -373,8 +378,8 @@ def visualize_text_attention(text, text_embedding, slots, attns, emotion_label=N
     hm = sns.heatmap(
         scaled_means,
         cmap='viridis',
-        xticklabels=[f'Block {i+1}' for i in range(num_blocks)],
-        yticklabels=[f'Slot {i+1}' for i in range(num_slots)],
+        xticklabels=[f'B{i+1}' for i in range(num_blocks)],
+        yticklabels=[f'S{i+1}' for i in range(num_slots)],
         annot=True,
         fmt='.2f',
         cbar_kws={'label': 'Normalized Value' if normalize else f'Mean Value (×10^-6)'},
@@ -382,12 +387,12 @@ def visualize_text_attention(text, text_embedding, slots, attns, emotion_label=N
         vmax=1 if normalize else None,
         ax=ax2
     )
-    # Set aspect ratio after creating heatmap
-    ax2.set_aspect(2.0)
-    ax2.set_title('Slot Block Values (Mean)' + (f' ({emotion_label})' if emotion_label else ''))
+    # Adjust heatmap aspect ratio
+    ax2.set_aspect('auto')
+    ax2.set_title(f'Slot Block Values (Mean)\nBlock Size: {block_size}')
     
-    # 3. 각 슬롯의 block 값 시퀀스 (1D with error bars)
-    ax3 = plt.subplot(gs[1, 0:])
+    # 3. Block value sequence by slot
+    ax3 = plt.subplot(gs[1, :])
     x = np.arange(num_blocks)
     
     if normalize:
@@ -402,37 +407,37 @@ def visualize_text_attention(text, text_embedding, slots, attns, emotion_label=N
                     marker='o',
                     capsize=5)
     
-    ax3.set_title('Block Values by Slot' + (f' ({emotion_label})' if emotion_label else ''))
+    ax3.set_title(f'Block Values by Slot\nwith Standard Deviation')
     ax3.set_xlabel('Block Index')
     ax3.set_ylabel('Normalized Value' if normalize else f'Mean Value (×10^-6)')
-    ax3.legend()
+    ax3.legend(ncol=4, loc='upper center', bbox_to_anchor=(0.5, -0.15))
     ax3.grid(True, alpha=0.3)
     if normalize:
         ax3.set_ylim(-0.1, 1.1)
     
-    # 4. 원본 텍스트 표시 (줄바꿈 적용)
-    wrapped_text = wrap_text(text)
-    fig.text(0.1, 0.02, f'Text:\n{wrapped_text}', 
-             wrap=True, fontsize=10,
-             bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+    # 4. Display original text
+    wrapped_text = wrap_text(text, width=80)
+    text_box = fig.text(0.1, 0.02, f'Original Text:\n{wrapped_text}', 
+                       wrap=True, fontsize=10,
+                       bbox=dict(facecolor='white', alpha=0.8, 
+                               edgecolor='lightgray', boxstyle='round,pad=0.5'))
     
     plt.tight_layout()
-    # 텍스트를 위한 여백 확보
-    plt.subplots_adjust(bottom=0.2)
+    plt.subplots_adjust(bottom=0.2, top=0.9)
     return fig
 
 
 def visualize_text_reconstruction(original_text, reconstructed_embedding, original_embedding):
     """
-    원본 텍스트와 재구성된 임베딩의 비교 시각화
+    Compare original text with reconstructed embeddings
     Args:
-        original_text: 원본 텍스트 (문자열)
-        reconstructed_embedding: 재구성된 임베딩 (B, D)
-        original_embedding: 원본 임베딩 (B, D)
+        original_text: Original text (string)
+        reconstructed_embedding: Reconstructed embedding (B, D)
+        original_embedding: Original embedding (B, D)
     Returns:
-        fig: matplotlib figure 객체
+        fig: matplotlib figure object
     """
-    # 코사인 유사도 계산
+    # Calculate cosine similarity
     cos_sim = F.cosine_similarity(reconstructed_embedding, original_embedding, dim=-1)
     
     fig = plt.figure(figsize=(8, 4))
@@ -444,13 +449,20 @@ def visualize_text_reconstruction(original_text, reconstructed_embedding, origin
 
 
 def visualize_class_comparison(texts, slots_list, attns_list, emotion_labels, 
-                             num_blocks=8, fig_size=(20, 15), normalize=True):
+                             num_blocks=8, fig_size=(20, 20), normalize=True):
     """
-    모든 감정 클래스에 대한 slot attention과 block values를 한 번에 비교 시각화
+    Compare slot attention and block values across all emotion classes in a single visualization
     """
+    # Set font for visualization
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+    
     num_classes = len(emotion_labels)
     fig = plt.figure(figsize=fig_size)
-    gs = plt.GridSpec(2, 1, height_ratios=[1, 1.5])
+    gs = plt.GridSpec(3, 1, height_ratios=[1, 1.5, 1.5])
+    
+    # Add main title
+    fig.suptitle(f'Emotion Class Comparison Analysis\nTotal {num_classes} Classes | {len(texts)} Samples', 
+                fontsize=14, y=0.95)
     
     # 1. Attention weights comparison
     ax1 = plt.subplot(gs[0])
@@ -460,8 +472,8 @@ def visualize_class_comparison(texts, slots_list, attns_list, emotion_labels,
         if len(attn_weights.shape) == 3:
             attn_weights = attn_weights.squeeze(1)
         attention_data.append(attn_weights[0])
-    
     attention_matrix = np.stack(attention_data)
+    
     if normalize:
         attention_matrix = normalize_values(attention_matrix)
     
@@ -476,9 +488,9 @@ def visualize_class_comparison(texts, slots_list, attns_list, emotion_labels,
         vmax=1 if normalize else None,
         ax=ax1
     )
-    ax1.set_title('Slot Attention Weights by Emotion Class')
+    ax1.set_title(f'Attention Weights by Emotion\n{"(Normalized)" if normalize else ""}')
     
-    # 2. Block values comparison
+    # 2. Block values comparison - wider ratio
     ax2 = plt.subplot(gs[1])
     block_data = []
     for slots in slots_list:
@@ -486,48 +498,178 @@ def visualize_class_comparison(texts, slots_list, attns_list, emotion_labels,
         block_size = slot_values.shape[-1] // num_blocks
         reshaped_values = slot_values[0].reshape(-1, num_blocks, block_size)
         block_means = np.mean(reshaped_values, axis=2)
-        block_data.append(block_means.flatten())
-    
+        block_data.append(block_means)
     block_matrix = np.stack(block_data)
+    
     if normalize:
         block_matrix = normalize_values(block_matrix)
     else:
         block_matrix = block_matrix * 1e6
     
-    hm = sns.heatmap(
-        block_matrix,
-        cmap='viridis',
-        xticklabels=[f'B{i+1}' for i in range(block_matrix.shape[1])],
-        yticklabels=emotion_labels,
-        annot=True,
-        fmt='.2f',
-        vmin=0 if normalize else None,
-        vmax=1 if normalize else None,
-        ax=ax2
-    )
-    ax2.set_title('Slot Block Values by Emotion Class' + 
-                 (' (Normalized)' if normalize else ' (×10^-6)'))
+    # Visualize block values for each emotion class
+    for slot_idx in range(block_matrix.shape[1]):
+        slot_data = block_matrix[:, slot_idx, :]
+        ax2.plot([], [], label=f'Slot {slot_idx+1}', linestyle='-')
     
-    # 3. Example texts (줄바꿈 적용)
-    text_y_pos = -0.2
-    fig.text(0.02, text_y_pos + 0.02, 'Example texts:', fontsize=10, weight='bold')
+    for class_idx, emotion in enumerate(emotion_labels):
+        for slot_idx in range(block_matrix.shape[1]):
+            slot_values = block_matrix[class_idx, slot_idx, :]
+            ax2.plot(range(num_blocks), slot_values, 
+                    marker='o', linestyle='-', alpha=0.7,
+                    label=f'{emotion} (S{slot_idx+1})')
+    
+    ax2.set_xlabel('Block Sequence')
+    ax2.set_ylabel('Block Value' + (' (Normalized)' if normalize else ' (×10^-6)'))
+    ax2.set_title('Sequential Block Values by Emotion and Slot')
+    ax2.set_xticks(range(num_blocks))
+    ax2.set_xticklabels([f'B{i+1}' for i in range(num_blocks)])
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    # 3. Temporal pattern analysis
+    ax3 = plt.subplot(gs[2])
+    mean_block_patterns = np.mean(block_matrix, axis=1)
+    for class_idx, emotion in enumerate(emotion_labels):
+        pattern = mean_block_patterns[class_idx]
+        ax3.plot(range(num_blocks), pattern, 
+                marker='o', label=emotion, linewidth=2)
+    
+    ax3.set_xlabel('Block Sequence')
+    ax3.set_ylabel('Mean Block Value' + (' (Normalized)' if normalize else ' (×10^-6)'))
+    ax3.set_title('Temporal Patterns by Emotion (All Slots Average)')
+    ax3.set_xticks(range(num_blocks))
+    ax3.set_xticklabels([f'B{i+1}' for i in range(num_blocks)])
+    ax3.grid(True, alpha=0.3)
+    ax3.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    # 4. Example texts
+    text_y_pos = -0.3
+    fig.text(0.02, text_y_pos + 0.02, 'Example Texts:', fontsize=10, weight='bold')
     for i, (text, label) in enumerate(zip(texts, emotion_labels)):
-        wrapped_text = wrap_text(text, width=80)  # 더 긴 너비 허용
+        wrapped_text = wrap_text(text, width=80)
         fig.text(0.02, text_y_pos - i*0.04, f'{label}: {wrapped_text}', 
                 fontsize=9, wrap=True,
-                bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+                bbox=dict(facecolor='white', alpha=0.8, 
+                         edgecolor='lightgray', boxstyle='round,pad=0.5'))
     
     plt.tight_layout()
-    # 텍스트를 위한 여백 확보
-    plt.subplots_adjust(bottom=0.3)
+    plt.subplots_adjust(bottom=0.3, top=0.92)
     return fig
 
+
+def analyze_emotion_relationships(slots_list, attns_list, emotion_labels, num_blocks=8):
+    """
+    Analyze relationships between emotion classes
+    
+    Returns:
+        - attention_similarity: Similarity matrix based on attention patterns
+        - block_pattern_similarity: Similarity matrix based on block patterns
+        - emotion_distances: Distance matrix between emotions
+    """
+    num_classes = len(emotion_labels)
+    
+    # 1. Calculate attention pattern similarity
+    attention_patterns = []
+    for attns in attns_list:
+        attn_weights = attns.detach().cpu().numpy()
+        if len(attn_weights.shape) == 3:
+            attn_weights = attn_weights.squeeze(1)
+        attention_patterns.append(attn_weights[0])
+    attention_patterns = np.stack(attention_patterns)
+    
+    attention_similarity = np.zeros((num_classes, num_classes))
+    for i in range(num_classes):
+        for j in range(num_classes):
+            attention_similarity[i,j] = np.corrcoef(
+                attention_patterns[i].flatten(), 
+                attention_patterns[j].flatten()
+            )[0,1]
+    
+    # 2. Calculate block pattern similarity
+    block_patterns = []
+    for slots in slots_list:
+        slot_values = slots.detach().cpu().numpy()
+        block_size = slot_values.shape[-1] // num_blocks
+        reshaped_values = slot_values[0].reshape(-1, num_blocks, block_size)
+        block_means = np.mean(reshaped_values, axis=2)
+        block_patterns.append(block_means)
+    block_patterns = np.stack(block_patterns)
+    
+    block_pattern_similarity = np.zeros((num_classes, num_classes))
+    for i in range(num_classes):
+        for j in range(num_classes):
+            block_pattern_similarity[i,j] = np.corrcoef(
+                block_patterns[i].flatten(), 
+                block_patterns[j].flatten()
+            )[0,1]
+    
+    # 3. Calculate overall feature-based distances
+    combined_features = np.concatenate([
+        attention_patterns.reshape(num_classes, -1),
+        block_patterns.reshape(num_classes, -1)
+    ], axis=1)
+    
+    emotion_distances = np.zeros((num_classes, num_classes))
+    for i in range(num_classes):
+        for j in range(num_classes):
+            emotion_distances[i,j] = np.linalg.norm(
+                combined_features[i] - combined_features[j]
+            )
+    
+    return attention_similarity, block_pattern_similarity, emotion_distances
+
+def visualize_emotion_relationships(attention_similarity, block_pattern_similarity, 
+                                 emotion_distances, emotion_labels):
+    """
+    Visualize relationships between emotion classes
+    """
+    fig = plt.figure(figsize=(20, 6))
+    
+    # 1. Attention pattern similarity
+    ax1 = plt.subplot(131)
+    sns.heatmap(attention_similarity, 
+                xticklabels=emotion_labels,
+                yticklabels=emotion_labels,
+                cmap='RdYlBu_r',
+                center=0,
+                annot=True,
+                fmt='.2f',
+                ax=ax1)
+    ax1.set_title('Attention Pattern Similarity\n(Correlation Coefficient)')
+    
+    # 2. Block pattern similarity
+    ax2 = plt.subplot(132)
+    sns.heatmap(block_pattern_similarity,
+                xticklabels=emotion_labels,
+                yticklabels=emotion_labels,
+                cmap='RdYlBu_r',
+                center=0,
+                annot=True,
+                fmt='.2f',
+                ax=ax2)
+    ax2.set_title('Block Pattern Similarity\n(Correlation Coefficient)')
+    
+    # 3. Emotion distances
+    ax3 = plt.subplot(133)
+    # Normalize distances to 0-1
+    normalized_distances = normalize_values(emotion_distances)
+    sns.heatmap(normalized_distances,
+                xticklabels=emotion_labels,
+                yticklabels=emotion_labels,
+                cmap='YlOrRd',
+                annot=True,
+                fmt='.2f',
+                ax=ax3)
+    ax3.set_title('Normalized Distances\n(Euclidean Distance in Feature Space)')
+    
+    plt.tight_layout()
+    return fig
 
 def log_text_visualizations(writer, epoch, text, text_embedding, slots, attns, 
                           reconstructed_embedding, emotion_label=None, num_blocks=8, 
                           tag_prefix='text', debug=False):
     """
-    텍스트 관련 시각화를 tensorboard에 기록
+    Log text-related visualizations to tensorboard
     """
     if debug:
         print(f"[DEBUG] Logging visualizations for epoch {epoch}")
@@ -536,15 +678,15 @@ def log_text_visualizations(writer, epoch, text, text_embedding, slots, attns,
         print(f"[DEBUG] Attention shape: {attns.shape}")
         print(f"[DEBUG] Slots shape: {slots.shape}")
     
-    # 1. 개별 시각화
+    # 1. Individual visualizations
     attn_fig = visualize_text_attention(text, text_embedding, slots, attns, 
                                       emotion_label=emotion_label, num_blocks=num_blocks)
     writer.add_figure(f'{tag_prefix}/attention_{emotion_label}', attn_fig, epoch)
     
-    # 2. 재구성 결과 시각화
+    # 2. Reconstruction visualization
     recon_fig = visualize_text_reconstruction(text, reconstructed_embedding, text_embedding)
     writer.add_figure(f'{tag_prefix}/reconstruction_{emotion_label}', recon_fig, epoch)
     
-    # 3. 수치 메트릭 기록
+    # 3. Record numerical metrics
     cos_sim = F.cosine_similarity(reconstructed_embedding, text_embedding, dim=-1).mean()
     writer.add_scalar(f'{tag_prefix}/cosine_similarity_{emotion_label}', cos_sim, epoch)

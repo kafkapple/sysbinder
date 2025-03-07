@@ -23,7 +23,8 @@ from datetime import datetime
 from sysbinder import SysBinderImageAutoEncoder, SysBinderTextAutoEncoder
 from data import GlobDataset, EmotionTextDataset
 from utils import (linear_warmup, cosine_anneal, log_text_visualizations, 
-                  visualize_class_comparison)
+                  visualize_class_comparison, analyze_emotion_relationships,
+                  visualize_emotion_relationships)
 
 from transformers import AutoTokenizer, AutoModel
 
@@ -38,12 +39,12 @@ from logger_wrapper import LoggerWrapper
 
 from sentence_transformers import SentenceTransformer
 
-# 1. TextProcessor 클래스 정의
+# 1. TextProcessor class definition
 class TextProcessor(nn.Module):
     def __init__(self, embedding_dim, hidden_size):
         super().__init__()
-        # 임베딩 차원에 따라 중간 레이어 크기 조정
-        intermediate_size = max(1024, embedding_dim * 2)  # 임베딩 차원의 2배 또는 1024 중 큰 값
+        # Adjust intermediate layer size based on embedding dimension
+        intermediate_size = max(1024, embedding_dim * 2)  # 2x embedding dim or 1024, whichever is larger
         
         self.projection = nn.Sequential(
             nn.Linear(embedding_dim, intermediate_size),
@@ -56,11 +57,11 @@ class TextProcessor(nn.Module):
     def forward(self, text_embedding):
         return self.projection(text_embedding)
 
-# 2. TextEmbeddingModel 클래스 정의
+# 2. TextEmbeddingModel class definition
 class TextEmbeddingModel:
     def __init__(self, model_name='bert-base-uncased'):
         self.model_name = model_name
-        # 모델별 임베딩 차원 정의
+        # Define embedding dimensions for each model
         self.embedding_dims = {
             'bert-base-uncased': 768,
             'bge-m3': 768,
@@ -79,21 +80,21 @@ class TextEmbeddingModel:
     
     def encode(self, texts):
         if 'bge' in self.model_name:
-            # BGE 모델용 인코딩
+            # Encoding for BGE models
             embeddings = self.model.encode(texts, convert_to_tensor=True)
             return embeddings
         else:
-            # BERT 계열 모델용 인코딩
+            # Encoding for BERT-based models
             inputs = self.tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
             inputs = {k: v.cuda() for k, v in inputs.items()}
             outputs = self.model(**inputs)
             return outputs.last_hidden_state.mean(dim=1)
 
-# 3. ArgumentParser 정의 및 인자 파싱
+# 3. ArgumentParser definition and argument parsing
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--seed', type=int, default=0)
-parser.add_argument('--batch_size', type=int, default=8)
+parser.add_argument('--batch_size', type=int, default=16)
 parser.add_argument('--num_workers', type=int, default=4)
 parser.add_argument('--image_size', type=int, default=128)
 parser.add_argument('--image_channels', type=int, default=3)
@@ -111,7 +112,7 @@ parser.add_argument('--clip', type=float, default=0.05)
 parser.add_argument('--epochs', type=int, default=3)
 
 parser.add_argument('--num_iterations', type=int, default=3)
-parser.add_argument('--num_slots', type=int, default=8)
+parser.add_argument('--num_slots', type=int, default=4)
 parser.add_argument('--num_blocks', type=int, default=8)
 parser.add_argument('--cnn_hidden_size', type=int, default=512)
 parser.add_argument('--slot_size', type=int, default=2048)
@@ -130,17 +131,17 @@ parser.add_argument('--tau_steps', type=int, default=30000)
 
 parser.add_argument('--use_dp', default=True, action='store_true')
 parser.add_argument('--data_type', type=str, choices=['clevr', 'isear'], default='isear',
-                    help='데이터 종류 선택: clevr 또는 isear')
+                    help='Data type selection: clevr or isear')
 
 parser.add_argument('--use_text_dvae', action='store_true', default=True,
-                    help='텍스트 임베딩에 dVAE 사용 여부')
+                    help='Use dVAE for text embeddings')
 parser.add_argument('--text_vocab_size', type=int, default=1024,
-                    help='텍스트 dVAE의 vocabulary size')
+                    help='Vocabulary size for text dVAE')
 
 parser.add_argument('--debug', action='store_true', default=False,
-                   help='디버그 모드 실행 (데이터 32개만 사용)')
+                   help='Run in debug mode (use only 32 samples)')
 parser.add_argument('--max_samples', type=int, default=32,
-                    help='시각화에 사용할 최대 샘플 수')
+                    help='Maximum number of samples for visualization')
 
 parser.add_argument('--wandb_project', type=str, default='sysbinder',
                     help='Weights & Biases project name')
@@ -152,11 +153,11 @@ parser.add_argument('--debug_print', action='store_true', default=False,
 
 parser.add_argument('--embedding_model', type=str, default='bert-base-uncased',
                     choices=['bert-base-uncased', 'bge-m3', 'bge-large', 'bge-small'],
-                    help='텍스트 임베딩 모델 선택')
+                    help='Text embedding model selection')
 
 args = parser.parse_args()
 
-# 4. TextEmbeddingModel 인스턴스 생성
+# 4. TextEmbeddingModel instance creation
 text_embedding_model = TextEmbeddingModel(args.embedding_model)
 
 torch.manual_seed(args.seed)
@@ -165,7 +166,7 @@ arg_str_list = ['{}={}'.format(k, v) for k, v in vars(args).items()]
 arg_str = '__'.join(arg_str_list)
 log_dir = os.path.join(args.log_path, datetime.today().isoformat())
 
-# wandb config 설정
+# wandb config setting
 wandb_config = {
     'model_type': args.data_type,
     'batch_size': args.batch_size,
@@ -173,10 +174,10 @@ wandb_config = {
     'slot_size': args.slot_size,
     'learning_rate': args.lr_dvae,
     'epochs': args.epochs,
-    # 필요한 다른 설정들 추가
+    # Add any other necessary settings
 }
 
-# LoggerWrapper 초기화
+# LoggerWrapper initialization
 writer = LoggerWrapper(
     log_dir=log_dir,
     project_name="sysbinder",
@@ -199,29 +200,29 @@ def visualize(image, recon_dvae, recon_tf, attns, N=8):
 
     return grid
 
-# 시각화 함수
+# Visualization function
 def visualize_embeddings(embeddings, labels=None, epoch=0, log_dir='logs', max_samples=32):
-    # 폰트 설정
+    # Font setting
     plt.rcParams['font.family'] = 'DejaVu Sans'
     
-    # 전체 데이터에 대한 시각화
+    # Visualization for entire dataset
     plt.figure(figsize=(15, 8))
     
-    # 감정 클래스 정의
+    # Emotion class definition
     emotion_classes = ["joy", "fear", "anger", "sadness", "disgust", "shame", "guilt"]
     
-    # 레이블 전처리
+    # Preprocess labels
     if torch.is_tensor(labels):
         labels = labels.cpu().numpy()
     
-    # labels가 2D 배열인 경우 첫 번째 열만 사용
+    # Use only the first column if labels are 2D array
     if len(labels.shape) > 1:
         labels = labels[:, 0]
     
-    # 레이블이 float인 경우 정수로 변환
+    # Convert labels to integer if they are float
     labels = np.round(labels).astype(np.int64)
     
-    # 각 클래스별 샘플 수 균형 맞추기
+    # Balance sample count for each class
     balanced_indices = []
     samples_per_class = max(1, max_samples // len(emotion_classes))
     
@@ -235,25 +236,25 @@ def visualize_embeddings(embeddings, labels=None, epoch=0, log_dir='logs', max_s
             )
             balanced_indices.extend(selected_indices)
     
-    # 선택된 인덱스로 데이터 필터링
+    # Filter data using selected indices
     embeddings = embeddings[balanced_indices]
     labels = labels[balanced_indices]
     
-    # DataFrame 생성
+    # Create DataFrame
     df = pd.DataFrame({
         'Dimension 1': embeddings[:, 0],
         'Dimension 2': embeddings[:, 1],
         'Emotion': [emotion_classes[label] for label in labels]
     })
     
-    # 메인 산점도
+    # Main scatter plot
     plt.subplot(1, 2, 1)
     scatter = sns.scatterplot(
         data=df,
         x='Dimension 1',
         y='Dimension 2',
         hue='Emotion',
-        style='Emotion',  # 각 감정별로 다른 마커 스타일 사용
+        style='Emotion',  # Use different marker styles for each emotion
         palette='deep',
         alpha=0.7,
         s=100
@@ -262,7 +263,7 @@ def visualize_embeddings(embeddings, labels=None, epoch=0, log_dir='logs', max_s
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', title='Emotion Class')
     plt.title(f"Text Embeddings by Emotion (Epoch {epoch})")
     
-    # 감정별 분포 시각화
+    # Visualization of emotion distribution
     plt.subplot(1, 2, 2)
     emotion_counts = df['Emotion'].value_counts()
     sns.barplot(x=emotion_counts.index, y=emotion_counts.values, palette='deep')
@@ -271,7 +272,7 @@ def visualize_embeddings(embeddings, labels=None, epoch=0, log_dir='logs', max_s
     
     plt.tight_layout()
     
-    # 이미지로 저장
+    # Save as image
     buf = io.BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=300)
     buf.seek(0)
@@ -286,12 +287,12 @@ def visualize_embeddings(embeddings, labels=None, epoch=0, log_dir='logs', max_s
     
     return image_tensor
 
-# 데이터셋 로드
+# Dataset loading
 if args.data_type == 'clevr':
     train_dataset = GlobDataset(root=args.data_path, phase='train', img_size=args.image_size)
     val_dataset = GlobDataset(root=args.data_path, phase='val', img_size=args.image_size)
 else:
-    # ISEAR 데이터셋 로드 - tokenizer를 text_embedding_model에서 가져옴
+    # Load ISEAR dataset - get tokenizer from text_embedding_model
     train_dataset = EmotionTextDataset(
         csv_path=args.data_path,
         tokenizer=text_embedding_model.tokenizer if hasattr(text_embedding_model, 'tokenizer') else None,
@@ -303,19 +304,19 @@ else:
         phase='val'
     )
 
-# 데이터 로드 부분에 디버그용 샘플 제한 추가
+# Add sample limitation for debug mode
 if args.debug:
-    args.batch_size = 8  # 디버그 모드에서는 작은 배치 사이즈 사용
-    debug_samples = 32  # 디버그용 샘플 수
+    args.batch_size = 8  # Use smaller batch size in debug mode
+    debug_samples = 32  # Number of debug samples
     
-    # debug 모드일 때는 일부 데이터만 사용
+    # Use subset of data in debug mode
     train_dataset = torch.utils.data.Subset(
         train_dataset, 
         indices=range(min(debug_samples, len(train_dataset)))
     )
     val_dataset = torch.utils.data.Subset(
         val_dataset,
-        indices=range(min(debug_samples // 2, len(val_dataset)))  # 검증은 절반
+        indices=range(min(debug_samples // 2, len(val_dataset)))  # Half for validation
     )
 
 train_sampler = None
@@ -324,21 +325,31 @@ val_sampler = None
 loader_kwargs = {
     'batch_size': args.batch_size,
     'shuffle': True,
-    'num_workers': args.num_workers if not args.debug else 0,  # 디버그 모드에서는 worker 수 줄임
+    'num_workers': args.num_workers if not args.debug else 0,  # Reduce workers in debug mode
     'pin_memory': True,
-    'drop_last': False,  # drop_last를 False로 변경
+    'drop_last': False,
 }
 
 train_loader = DataLoader(train_dataset, sampler=train_sampler, **loader_kwargs)
 val_loader = DataLoader(val_dataset, sampler=val_sampler, **loader_kwargs)
 
+# Print dataset information
+print(f"\n=== Dataset Information ===")
+print(f"Training data size: {len(train_dataset):,}")
+print(f"Validation data size: {len(val_dataset):,}")
+print(f"Batch size: {args.batch_size}")
+print(f"Total batches: {len(train_loader):,} (train) / {len(val_loader):,} (val)")
+print(f"Debug mode: {'ON' if args.debug else 'OFF'}")
+print(f"Debug print: {'ON' if args.debug_print else 'OFF'}")
+print("========================\n")
+
 train_epoch_size = len(train_loader)
 val_epoch_size = len(val_loader)
 
-# log_interval이 0이 되지 않도록 보호
+# Protect log_interval from becoming 0
 log_interval = max(1, train_epoch_size // 5)
 
-# 데이터 타입에 따라 적절한 모델 초기화
+# Initialize appropriate model based on data type
 if args.data_type == 'clevr':
     model = SysBinderImageAutoEncoder(args)
 else:
@@ -368,26 +379,28 @@ optimizer = Adam([
 if checkpoint is not None:
     optimizer.load_state_dict(checkpoint['optimizer'])
 
-# 텍스트 프로세서 초기화
+# Text processor initialization
 if args.data_type == 'isear':
     text_processor = TextProcessor(
-        embedding_dim=text_embedding_model.embedding_dim,  # 이제 올바르게 접근 가능
+        embedding_dim=text_embedding_model.embedding_dim,  # Now correctly accessible
         hidden_size=args.slot_size
     )
 
 def print_gpu_memory():
     if torch.cuda.is_available():
-        print(f'GPU 메모리 사용량: {torch.cuda.memory_allocated() / 1024**2:.2f}MB')
+        allocated = torch.cuda.memory_allocated() / 1024**2
+        reserved = torch.cuda.memory_reserved() / 1024**2
+        print(f"GPU Memory - Allocated: {allocated:.1f}MB / Reserved: {reserved:.1f}MB")
 
-# 마지막 배치의 텍스트 임베딩과 감정 레이블을 저장할 변수 추가
+# Add variables to store last batch embeddings and emotions
 last_batch_embeddings = None
-last_batch_emotions = None  # text 대신 emotions로 변경
+last_batch_emotions = None  # Changed from text to emotions
 
-# 클래스별 시각화를 위한 변수 추가
+# Add variables for class-wise visualization
 emotion_classes = ["joy", "fear", "anger", "sadness", "disgust", "shame", "guilt"]
-last_visualized_emotions = set()  # 마지막으로 시각화된 감정들 추적
+last_visualized_emotions = set()  # Track last visualized emotions
 
-# 클래스별 시각화를 위한 데이터 수집 변수 추가
+# Add variables for collecting data for class-wise visualization
 class_visualization_data = {
     'texts': [],
     'slots': [],
@@ -395,6 +408,7 @@ class_visualization_data = {
     'labels': []
 }
 
+# Training loop
 for epoch in range(start_epoch, args.epochs):
     model.train()
     if args.data_type == 'isear':
@@ -404,12 +418,12 @@ for epoch in range(start_epoch, args.epochs):
         if args.data_type == 'clevr':
             images = batch.cuda()
         elif args.data_type == 'isear':
-            # 텍스트 데이터 처리
+            # Process text data
             text_data = batch['text']
             emotion_labels = batch['emotion']
-            text_embeddings = text_embedding_model.encode(text_data)  # encode 메서드 사용
+            text_embeddings = text_embedding_model.encode(text_data)  # Use encode method
             
-            # 마지막 배치 저장
+            # Store last batch
             last_batch_embeddings = text_embeddings.detach()
             last_batch_emotions = emotion_labels
             
@@ -462,8 +476,9 @@ for epoch in range(start_epoch, args.epochs):
         
         with torch.no_grad():
             if batch_idx % log_interval == 0:
-                print('Train Epoch: {:3} [{:5}/{:5}] \t Loss: {:F} \t MSE: {:F}'.format(
-                      epoch+1, batch_idx, train_epoch_size, loss.item(), mse.item()))
+                print(f'\n[Epoch {epoch+1}/{args.epochs}] [{batch_idx:,}/{train_epoch_size:,}]')
+                print(f'Loss: {loss.item():.4f} (MSE: {mse.item():.4f}, CE: {cross_entropy.item():.4f})')
+                print(f'Learning rate: {optimizer.param_groups[0]["lr"]:.2e}')
                 
                 writer.add_scalar('TRAIN/loss', loss.item(), global_step)
                 writer.add_scalar('TRAIN/cross_entropy', cross_entropy.item(), global_step)
@@ -476,28 +491,28 @@ for epoch in range(start_epoch, args.epochs):
 
                 print_gpu_memory()
 
-            # 텍스트 데이터의 경우 시각화 추가
+            # If text data, add visualization
             if args.data_type == 'isear':
-                # 배치 내의 모든 샘플에 대해 처리
+                # Process all samples in batch
                 for sample_idx in range(len(text_data)):
-                    # 감정 레이블 가져오기
+                    # Get emotion label
                     emotion_idx = torch.argmax(emotion_labels[sample_idx]).item()
                     emotion_label = emotion_classes[emotion_idx]
                     
-                    # 아직 시각화되지 않은 감정 클래스이거나 디버그 모드인 경우에만 시각화
+                    # Visualize only if emotion class hasn't been visualized or in debug mode
                     if emotion_label not in last_visualized_emotions or args.debug:
                         slots_data = (model.module if args.use_dp else model).text_encoder.sysbinder(
                             text_embeddings[sample_idx].unsqueeze(0).unsqueeze(0)
                         )[0]
                         
-                        # 클래스별 비교를 위한 데이터 수집
+                        # Collect data for class-wise comparison
                         if emotion_label not in [label for label in class_visualization_data['labels']]:
                             class_visualization_data['texts'].append(text_data[sample_idx])
                             class_visualization_data['slots'].append(slots_data)
                             class_visualization_data['attns'].append(attns[sample_idx])
                             class_visualization_data['labels'].append(emotion_label)
                         
-                        # debug print를 조건부로 실행
+                        # Execute debug print conditionally
                         if args.debug_print:
                             print(f"Processing emotion: {emotion_label}")
                             print(f"Text: {text_data[sample_idx]}")
@@ -520,8 +535,9 @@ for epoch in range(start_epoch, args.epochs):
                         
                         last_visualized_emotions.add(emotion_label)
                     
-                    # 모든 감정 클래스가 시각화되었다면 클래스별 비교 시각화 생성
+                    # If all emotion classes have been visualized, create class-wise comparison visualization
                     if len(last_visualized_emotions) == len(emotion_classes):
+                        # Class-wise comparison visualization
                         comparison_fig = visualize_class_comparison(
                             texts=class_visualization_data['texts'],
                             slots_list=class_visualization_data['slots'],
@@ -531,7 +547,39 @@ for epoch in range(start_epoch, args.epochs):
                         )
                         writer.add_figure('train/class_comparison', comparison_fig, epoch)
                         
-                        # 데이터 초기화
+                        # Emotion class relationship analysis
+                        attn_sim, block_sim, emotion_dist = analyze_emotion_relationships(
+                            slots_list=class_visualization_data['slots'],
+                            attns_list=class_visualization_data['attns'],
+                            emotion_labels=class_visualization_data['labels'],
+                            num_blocks=args.num_blocks
+                        )
+                        
+                        # Relationship visualization
+                        relationship_fig = visualize_emotion_relationships(
+                            attn_sim, block_sim, emotion_dist,
+                            class_visualization_data['labels']
+                        )
+                        writer.add_figure('train/emotion_relationships', relationship_fig, epoch)
+                        
+                        # Record quantitative metrics
+                        for i, emotion1 in enumerate(class_visualization_data['labels']):
+                            for j, emotion2 in enumerate(class_visualization_data['labels']):
+                                if i < j:  # Avoid duplicates
+                                    writer.add_scalar(
+                                        f'relationships/attention_similarity/{emotion1}_vs_{emotion2}',
+                                        attn_sim[i,j], epoch
+                                    )
+                                    writer.add_scalar(
+                                        f'relationships/block_similarity/{emotion1}_vs_{emotion2}',
+                                        block_sim[i,j], epoch
+                                    )
+                                    writer.add_scalar(
+                                        f'relationships/emotion_distance/{emotion1}_vs_{emotion2}',
+                                        emotion_dist[i,j], epoch
+                                    )
+                        
+                        # Data initialization
                         last_visualized_emotions.clear()
                         class_visualization_data = {
                             'texts': [],
@@ -540,7 +588,7 @@ for epoch in range(start_epoch, args.epochs):
                             'labels': []
                         }
             else:
-                # 이미지 데이터의 경우 기존 시각화 유지
+                # If image data, keep existing visualization
                 writer.add_image('train/original', vutils.make_grid(images[:8]), epoch * len(train_loader) + batch_idx)
                 writer.add_image('train/recon', vutils.make_grid(recon_dvae[:8]), epoch * len(train_loader) + batch_idx)
 
@@ -551,13 +599,13 @@ for epoch in range(start_epoch, args.epochs):
             grid = visualize(images, recon_dvae, recon_tf, attns, N=8)
             writer.add_image('TRAIN_recons/epoch={:03}'.format(epoch+1), grid)
         elif args.data_type == 'isear' and last_batch_embeddings is not None:
-            # CPU로 이동 후 numpy로 변환
+            # Move to CPU and convert to numpy
             embeddings_np = last_batch_embeddings.cpu().numpy()
-            max_samples = min(args.max_samples, len(embeddings_np))  # 최대 16개 샘플로 제한
+            max_samples = min(args.max_samples, len(embeddings_np))  # Limit to max 16 samples
             
             embedding_tensor = visualize_embeddings(
                 embeddings_np,
-                labels=last_batch_emotions,  # text 대신 emotions 사용
+                labels=last_batch_emotions,  # Changed from text to emotions
                 epoch=epoch,
                 log_dir=log_dir,
                 max_samples=max_samples
@@ -570,15 +618,15 @@ for epoch in range(start_epoch, args.epochs):
         
         val_cross_entropy = 0.
         val_mse = 0.
-        val_count = 0  # 배치 카운트 추가
+        val_count = 0  # Add batch count
 
         for batch, image in enumerate(val_loader):
             if args.data_type == 'clevr':
                 image = image.cuda()
                 (recon_dvae, cross_entropy, mse, attns) = model(image, tau)
             elif args.data_type == 'isear':
-                # 텍스트 데이터 처리
-                text_data = image['text']  # validation에서는 image가 실제로는 batch
+                # Process text data
+                text_data = image['text']  # Validation actually uses batch
                 text_embeddings = text_embedding_model.encode(text_data)
                 (recon_dvae, cross_entropy, mse, attns) = model(text_embeddings, tau)
 
@@ -590,7 +638,7 @@ for epoch in range(start_epoch, args.epochs):
             val_mse += mse.item()
             val_count += 1
 
-        # 0으로 나누는 것 방지
+        # Avoid division by 0
         if val_count > 0:
             val_cross_entropy /= val_count
             val_mse /= val_count
