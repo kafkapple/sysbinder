@@ -298,44 +298,81 @@ class OneHotDictionary(nn.Module):
         return token_embs
 
 
-def visualize_text_attention(text, text_embedding, slots, attns, fig_size=(10, 8)):
+def visualize_text_attention(text, text_embedding, slots, attns, num_blocks=8, fig_size=(15, 10)):
     """
-    텍스트 데이터의 attention 시각화
+    Text data attention visualization with proper block structure
     Args:
-        text: 원본 텍스트 (문자열)
-        text_embedding: 텍스트 임베딩 (B, D)
+        text: 원본 텍스트
+        text_embedding: 텍스트 임베딩
         slots: 슬롯 표현 (B, num_slots, slot_size)
-        attns: attention weights (B, num_slots, 1)
-    Returns:
-        fig: matplotlib figure 객체
+        attns: attention weights
+        num_blocks: 블록 수 (default: 8)
+        fig_size: 그림 크기
     """
-    B, num_slots, _ = slots.size()
+    B, num_slots, slot_size = slots.size()
     
     # Figure 생성
     fig = plt.figure(figsize=fig_size)
     
-    # 1. Attention weights 시각화
-    plt.subplot(2, 1, 1)
-    # 3D -> 2D로 변환
-    attn_weights = attns.squeeze(-1).detach().cpu().numpy()  # (B, num_slots)
-    if len(attn_weights.shape) == 3:  # (1, num_slots, 1) -> (num_slots, 1)
-        attn_weights = attn_weights.squeeze(0)
-    if len(attn_weights.shape) == 1:  # (num_slots,) -> (num_slots, 1)
-        attn_weights = attn_weights[:, None]
+    # 1. Attention weights 시각화 (4 slots)
+    plt.subplot(2, 2, 1)
+    attn_weights = attns.detach().cpu().numpy()
+    if len(attn_weights.shape) == 3:
+        attn_weights = attn_weights.squeeze(1)
+    if len(attn_weights.shape) == 1:
+        attn_weights = attn_weights.reshape(1, -1)
         
-    sns.heatmap(attn_weights, cmap='YlOrRd', 
-                xticklabels=['Text'], yticklabels=[f'Slot {i+1}' for i in range(num_slots)])
+    sns.heatmap(
+        attn_weights, 
+        cmap='YlOrRd',
+        xticklabels=[f'Slot {i+1}' for i in range(num_slots)],
+        yticklabels=['Text'],
+        annot=True,
+        fmt='.3f',
+        square=True
+    )
     plt.title('Slot Attention Weights')
     
-    # 2. 슬롯 값들의 분포 시각화
-    plt.subplot(2, 1, 2)
+    # 2. 각 슬롯의 block 값 분포 시각화 (4 slots x 8 blocks)
+    plt.subplot(2, 2, 2)
     slot_values = slots.detach().cpu().numpy()
-    if len(slot_values.shape) == 3:  # (B, num_slots, slot_size)
-        slot_values = slot_values.reshape(-1, slot_values.shape[-1])
-    sns.boxplot(data=pd.DataFrame(slot_values))
-    plt.title('Slot Value Distributions')
-    plt.xlabel('Slot Components')
-    plt.ylabel('Value')
+    
+    # 실제 num_blocks에 맞게 reshape
+    block_size = slot_size // num_blocks
+    reshaped_values = slot_values[0].reshape(num_slots, num_blocks, -1)
+    block_means = np.mean(reshaped_values, axis=2)
+    
+    # 값의 스케일 조정
+    scale_factor = 1e6  # 10^6으로 스케일 조정
+    scaled_means = block_means * scale_factor
+    
+    sns.heatmap(
+        scaled_means,
+        cmap='viridis',
+        xticklabels=[f'Block {i+1}' for i in range(num_blocks)],
+        yticklabels=[f'Slot {i+1}' for i in range(num_slots)],
+        annot=True,
+        fmt='.2e',  # 과학적 표기법 사용
+        cbar_kws={'label': f'Mean Value (×10^-6)'}
+    )
+    plt.title('Slot Block Values (Mean)')
+    
+    # 3. 각 슬롯의 block 값 시퀀스 (1D)
+    plt.subplot(2, 2, 3)
+    for i in range(num_slots):
+        plt.plot(scaled_means[i], label=f'Slot {i+1}', marker='o')
+    plt.title('Block Values by Slot')
+    plt.xlabel('Block Index')
+    plt.ylabel(f'Mean Value (×10^-6)')
+    plt.legend()
+    
+    # 4. 슬롯별 전체 값 분포
+    plt.subplot(2, 2, 4)
+    scaled_values = [slot_values[0, i] * scale_factor for i in range(num_slots)]
+    plt.boxplot(scaled_values,
+                labels=[f'Slot {i+1}' for i in range(num_slots)])
+    plt.title('Overall Slot Value Distributions')
+    plt.ylabel(f'Value (×10^-6)')
     
     plt.tight_layout()
     return fig
@@ -363,7 +400,7 @@ def visualize_text_reconstruction(original_text, reconstructed_embedding, origin
 
 
 def log_text_visualizations(writer, epoch, text, text_embedding, slots, attns, 
-                          reconstructed_embedding, tag_prefix='text'):
+                          reconstructed_embedding, num_blocks=8, tag_prefix='text', debug=False):
     """
     텍스트 관련 시각화를 tensorboard에 기록
     Args:
@@ -374,10 +411,18 @@ def log_text_visualizations(writer, epoch, text, text_embedding, slots, attns,
         slots: 슬롯 표현
         attns: attention weights
         reconstructed_embedding: 재구성된 임베딩
+        num_blocks: 블록 수 (default: 8)
         tag_prefix: tensorboard에 기록될 태그의 접두어
+        debug: 디버그 출력 활성화 여부
     """
+    if debug:
+        print(f"[DEBUG] Logging visualizations for epoch {epoch}")
+        print(f"[DEBUG] Text: {text}")
+        print(f"[DEBUG] Attention shape: {attns.shape}")
+        print(f"[DEBUG] Slots shape: {slots.shape}")
+    
     # 1. Attention 시각화
-    attn_fig = visualize_text_attention(text, text_embedding, slots, attns)
+    attn_fig = visualize_text_attention(text, text_embedding, slots, attns, num_blocks=num_blocks)
     writer.add_figure(f'{tag_prefix}/attention', attn_fig, epoch)
     
     # 2. 재구성 결과 시각화
