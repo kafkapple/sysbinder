@@ -29,6 +29,9 @@ from transformers import AutoTokenizer, AutoModel
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
 # 텍스트 임베딩 모델 초기화
 text_tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
 text_embedding_model = AutoModel.from_pretrained('bert-base-uncased')
@@ -149,13 +152,17 @@ if args.data_type == 'clevr':
     train_dataset = GlobDataset(root=args.data_path, phase='train', img_size=args.image_size)
     val_dataset = GlobDataset(root=args.data_path, phase='val', img_size=args.image_size)
 else:
+    # ISEAR 데이터셋 로드
+    isear_df = pd.read_csv('data/isear/isear.csv')
+    train_df, val_df = train_test_split(isear_df, test_size=0.2, random_state=args.seed)  # 80% train, 20% val
+    
     train_dataset = EmotionTextDataset(
-        csv_path='path/to/text.csv',
+        dataframe=train_df,
         tokenizer=text_tokenizer,
         phase='train'
     )
     val_dataset = EmotionTextDataset(
-        csv_path='path/to/text.csv',
+        dataframe=val_df,
         tokenizer=text_tokenizer,
         phase='val'
     )
