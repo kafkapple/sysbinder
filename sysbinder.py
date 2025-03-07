@@ -1,6 +1,6 @@
 from utils import *
 from transformer import TransformerEncoder, TransformerDecoder
-from dvae import dVAE
+from dvae import dVAE, dVAE_text
 
 
 class BlockPrototypeMemory(nn.Module):
@@ -206,7 +206,7 @@ class SysBinderImageAutoEncoder(nn.Module):
         self.num_blocks = args.num_blocks
 
         # dvae
-        self.dvae = dVAE(args.vocab_size, args.image_channels)
+        self.dvae = dVAE(args.vocab_size, input_channels=args.image_channels)  # 이미지용 dVAE는 input_channels 키워드 인자 사용
 
         # encoder networks
         self.image_encoder = ImageEncoder(args)
@@ -372,6 +372,14 @@ class SysBinderTextAutoEncoder(nn.Module):
         self.num_prototypes = args.num_prototypes
         self.d_model = args.d_model
         self.num_blocks = args.num_blocks
+        self.use_dvae = getattr(args, 'use_text_dvae', False)  # dVAE 사용 여부
+        
+        if self.use_dvae:
+            # Text dVAE - 텍스트 임베딩을 이산화된 토큰으로 변환
+            self.dvae = dVAE_text(args.vocab_size, self.d_model)  # 텍스트용 dVAE 사용
+            self.dict = OneHotDictionary(args.vocab_size, self.d_model)
+            self.bos = nn.Parameter(torch.Tensor(1, 1, self.d_model))
+            nn.init.xavier_uniform_(self.bos)
 
         # Text Encoder (sysbinder 기반)
         self.text_encoder = nn.ModuleDict({
@@ -401,12 +409,12 @@ class SysBinderTextAutoEncoder(nn.Module):
         
         # Parameters
         self.block_pos = nn.Parameter(torch.zeros(1, 1, args.d_model * args.num_blocks))
-        nn.init.normal_(self.block_pos, std=0.02)  # 초기화 추가
+        nn.init.normal_(self.block_pos, std=0.02)
 
     def forward(self, text_embedding, tau=None):
         """
         text_embedding: B, D (텍스트 임베딩)
-        tau: float (not used for text, kept for API compatibility)
+        tau: float (dVAE 사용 시 temperature parameter)
         """
         # 입력 텍스트 임베딩의 차원 처리
         if len(text_embedding.size()) > 2:
@@ -414,35 +422,52 @@ class SysBinderTextAutoEncoder(nn.Module):
             text_embedding = text_embedding.view(B, -1)  # 배치 차원을 제외한 나머지 차원을 펼침
         else:
             B = text_embedding.size(0)
-        
+
+        if self.use_dvae:
+            # dVAE를 통한 임베딩 처리 (더 이상 2D로 변환할 필요 없음)
+            z_logits = F.log_softmax(self.dvae.encoder(text_embedding), dim=1)  # B, vocab_size
+            z_soft = gumbel_softmax(z_logits, tau, False, dim=1)  # B, vocab_size
+            z_hard = gumbel_softmax(z_logits, tau, True, dim=1).detach()  # B, vocab_size
+            z_emb = self.dict(z_hard)  # B, d_model
+            
+            # dVAE reconstruction
+            dvae_recon = self.dvae.decoder(z_soft)  # B, D
+            dvae_mse = ((text_embedding - dvae_recon) ** 2).sum() / B
+            
+            # 처리된 임베딩으로 sysbinder 입력 생성
+            emb_set = z_emb.unsqueeze(1)  # B, 1, D
+        else:
+            # 기존 방식대로 직접 임베딩 처리
+            emb_set = text_embedding.unsqueeze(1)  # B, 1, D
+            dvae_mse = torch.tensor(0.0, device=text_embedding.device)
+            
         # 텍스트 임베딩 전처리
-        emb_set = text_embedding.unsqueeze(1)  # B, 1, D
         emb_set = self.text_encoder['mlp'](self.text_encoder['layer_norm'](emb_set))
         
         # Sysbinder를 통한 처리
-        slots, attns = self.text_encoder['sysbinder'](emb_set)  # slots: B, num_slots, slot_size
-                                                               # attns: B, num_slots, 1
+        slots, attns = self.text_encoder['sysbinder'](emb_set)
         
         # Block coupling
-        slots = self.text_decoder['slot_proj'](slots)  # B, num_slots, num_blocks * d_model
+        slots = self.text_decoder['slot_proj'](slots)
         slots = slots + self.text_decoder['block_pos_proj'](self.block_pos)
-        slots = slots.reshape(B, self.num_slots, self.num_blocks, -1)  # B, num_slots, num_blocks, d_model
+        slots = slots.reshape(B, self.num_slots, self.num_blocks, -1)
         slots = self.text_decoder['block_coupler'](slots.flatten(end_dim=1))
         slots = slots.reshape(B, self.num_slots * self.num_blocks, -1)
         
         # 최종 출력 생성
         pred = slots.mean(dim=1)  # B, d_model
         
-        # Reconstruction loss (L2 loss)
-        recon_loss = F.mse_loss(pred, text_embedding)
+        if self.use_dvae:
+            # dVAE 사용 시 reconstruction loss 계산 (L2 loss 사용)
+            cross_entropy = F.mse_loss(pred, z_emb)  # z_emb은 이미 d_model 차원으로 변환된 상태
+        else:
+            # 기존 방식의 reconstruction loss
+            cross_entropy = F.mse_loss(pred, text_embedding)
         
-        # MSE 계산 - 텍스트 임베딩 공간에서의 재구성 오차
-        mse = ((text_embedding - pred) ** 2).sum() / B
-        
-        return (text_embedding,  # 원본 임베딩 반환 (reconstruction)
-                recon_loss,      # reconstruction loss
-                mse,            # MSE loss
-                attns)           # attention maps
+        return (dvae_recon if self.use_dvae else text_embedding,
+                cross_entropy,
+                dvae_mse,
+                attns)
 
     def encode(self, text_embedding):
         """

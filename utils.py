@@ -5,6 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.decomposition import PCA
+import pandas as pd
 
 
 def linear_warmup(step, start_value, final_value, start_step, final_step):
@@ -292,3 +296,94 @@ class OneHotDictionary(nn.Module):
         tokens = torch.argmax(x, dim=-1)  # batch_size x N
         token_embs = self.dictionary(tokens)  # batch_size x N x emb_size
         return token_embs
+
+
+def visualize_text_attention(text, text_embedding, slots, attns, fig_size=(10, 8)):
+    """
+    텍스트 데이터의 attention 시각화
+    Args:
+        text: 원본 텍스트 (문자열)
+        text_embedding: 텍스트 임베딩 (B, D)
+        slots: 슬롯 표현 (B, num_slots, slot_size)
+        attns: attention weights (B, num_slots, 1)
+    Returns:
+        fig: matplotlib figure 객체
+    """
+    B, num_slots, _ = slots.size()
+    
+    # Figure 생성
+    fig = plt.figure(figsize=fig_size)
+    
+    # 1. Attention weights 시각화
+    plt.subplot(2, 1, 1)
+    # 3D -> 2D로 변환
+    attn_weights = attns.squeeze(-1).detach().cpu().numpy()  # (B, num_slots)
+    if len(attn_weights.shape) == 3:  # (1, num_slots, 1) -> (num_slots, 1)
+        attn_weights = attn_weights.squeeze(0)
+    if len(attn_weights.shape) == 1:  # (num_slots,) -> (num_slots, 1)
+        attn_weights = attn_weights[:, None]
+        
+    sns.heatmap(attn_weights, cmap='YlOrRd', 
+                xticklabels=['Text'], yticklabels=[f'Slot {i+1}' for i in range(num_slots)])
+    plt.title('Slot Attention Weights')
+    
+    # 2. 슬롯 값들의 분포 시각화
+    plt.subplot(2, 1, 2)
+    slot_values = slots.detach().cpu().numpy()
+    if len(slot_values.shape) == 3:  # (B, num_slots, slot_size)
+        slot_values = slot_values.reshape(-1, slot_values.shape[-1])
+    sns.boxplot(data=pd.DataFrame(slot_values))
+    plt.title('Slot Value Distributions')
+    plt.xlabel('Slot Components')
+    plt.ylabel('Value')
+    
+    plt.tight_layout()
+    return fig
+
+
+def visualize_text_reconstruction(original_text, reconstructed_embedding, original_embedding):
+    """
+    원본 텍스트와 재구성된 임베딩의 비교 시각화
+    Args:
+        original_text: 원본 텍스트 (문자열)
+        reconstructed_embedding: 재구성된 임베딩 (B, D)
+        original_embedding: 원본 임베딩 (B, D)
+    Returns:
+        fig: matplotlib figure 객체
+    """
+    # 코사인 유사도 계산
+    cos_sim = F.cosine_similarity(reconstructed_embedding, original_embedding, dim=-1)
+    
+    fig = plt.figure(figsize=(8, 4))
+    plt.text(0.1, 0.7, f'Original Text: {original_text}', fontsize=12)
+    plt.text(0.1, 0.4, f'Reconstruction Similarity: {cos_sim.item():.4f}', fontsize=12)
+    plt.axis('off')
+    
+    return fig
+
+
+def log_text_visualizations(writer, epoch, text, text_embedding, slots, attns, 
+                          reconstructed_embedding, tag_prefix='text'):
+    """
+    텍스트 관련 시각화를 tensorboard에 기록
+    Args:
+        writer: tensorboard SummaryWriter 객체
+        epoch: 현재 에폭
+        text: 원본 텍스트
+        text_embedding: 텍스트 임베딩
+        slots: 슬롯 표현
+        attns: attention weights
+        reconstructed_embedding: 재구성된 임베딩
+        tag_prefix: tensorboard에 기록될 태그의 접두어
+    """
+    # 1. Attention 시각화
+    attn_fig = visualize_text_attention(text, text_embedding, slots, attns)
+    writer.add_figure(f'{tag_prefix}/attention', attn_fig, epoch)
+    
+    # 2. 재구성 결과 시각화
+    recon_fig = visualize_text_reconstruction(text, reconstructed_embedding, text_embedding)
+    writer.add_figure(f'{tag_prefix}/reconstruction', recon_fig, epoch)
+    
+    # 3. 수치 메트릭 기록
+    cos_sim = F.cosine_similarity(reconstructed_embedding, text_embedding, dim=-1).mean()
+    writer.add_scalar(f'{tag_prefix}/cosine_similarity', cos_sim, epoch)
