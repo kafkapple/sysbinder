@@ -22,7 +22,8 @@ from datetime import datetime
 
 from sysbinder import SysBinderImageAutoEncoder, SysBinderTextAutoEncoder
 from data import GlobDataset, EmotionTextDataset
-from utils import linear_warmup, cosine_anneal, log_text_visualizations
+from utils import (linear_warmup, cosine_anneal, log_text_visualizations, 
+                  visualize_class_comparison)
 
 from transformers import AutoTokenizer, AutoModel
 
@@ -92,7 +93,7 @@ class TextEmbeddingModel:
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--seed', type=int, default=0)
-parser.add_argument('--batch_size', type=int, default=40)
+parser.add_argument('--batch_size', type=int, default=8)
 parser.add_argument('--num_workers', type=int, default=4)
 parser.add_argument('--image_size', type=int, default=128)
 parser.add_argument('--image_channels', type=int, default=3)
@@ -107,10 +108,10 @@ parser.add_argument('--lr_dec', type=float, default=3e-4)
 parser.add_argument('--lr_warmup_steps', type=int, default=30000)
 parser.add_argument('--lr_half_life', type=int, default=250000)
 parser.add_argument('--clip', type=float, default=0.05)
-parser.add_argument('--epochs', type=int, default=1)
+parser.add_argument('--epochs', type=int, default=3)
 
 parser.add_argument('--num_iterations', type=int, default=3)
-parser.add_argument('--num_slots', type=int, default=4)
+parser.add_argument('--num_slots', type=int, default=8)
 parser.add_argument('--num_blocks', type=int, default=8)
 parser.add_argument('--cnn_hidden_size', type=int, default=512)
 parser.add_argument('--slot_size', type=int, default=2048)
@@ -136,9 +137,9 @@ parser.add_argument('--use_text_dvae', action='store_true', default=True,
 parser.add_argument('--text_vocab_size', type=int, default=1024,
                     help='텍스트 dVAE의 vocabulary size')
 
-parser.add_argument('--debug', action='store_true',
+parser.add_argument('--debug', action='store_true', default=False,
                    help='디버그 모드 실행 (데이터 32개만 사용)')
-parser.add_argument('--max_samples', type=int, default=16,
+parser.add_argument('--max_samples', type=int, default=32,
                     help='시각화에 사용할 최대 샘플 수')
 
 parser.add_argument('--wandb_project', type=str, default='sysbinder',
@@ -199,24 +200,19 @@ def visualize(image, recon_dvae, recon_tf, attns, N=8):
     return grid
 
 # 시각화 함수
-def visualize_embeddings(embeddings, labels=None, epoch=0, log_dir='logs', max_samples=16):
+def visualize_embeddings(embeddings, labels=None, epoch=0, log_dir='logs', max_samples=32):
     # 폰트 설정
     plt.rcParams['font.family'] = 'DejaVu Sans'
     
     # 전체 데이터에 대한 시각화
-    plt.figure(figsize=(15, 6))
+    plt.figure(figsize=(15, 8))
     
     # 감정 클래스 정의
     emotion_classes = ["joy", "fear", "anger", "sadness", "disgust", "shame", "guilt"]
     
-    # 레이블 전처리: 텐서를 numpy 배열로 변환하고 첫 번째 차원의 값만 사용
+    # 레이블 전처리
     if torch.is_tensor(labels):
         labels = labels.cpu().numpy()
-    
-    # 디버그 출력 추가
-    print(f"Labels shape: {labels.shape}")
-    print(f"Labels type: {labels.dtype}")
-    print(f"Labels content: {labels}")
     
     # labels가 2D 배열인 경우 첫 번째 열만 사용
     if len(labels.shape) > 1:
@@ -225,16 +221,29 @@ def visualize_embeddings(embeddings, labels=None, epoch=0, log_dir='logs', max_s
     # 레이블이 float인 경우 정수로 변환
     labels = np.round(labels).astype(np.int64)
     
-    # max_samples 적용
-    if max_samples:
-        embeddings = embeddings[:max_samples]
-        labels = labels[:max_samples]
+    # 각 클래스별 샘플 수 균형 맞추기
+    balanced_indices = []
+    samples_per_class = max(1, max_samples // len(emotion_classes))
     
-    # DataFrame 생성하여 scatter plot 생성
+    for class_idx in range(len(emotion_classes)):
+        class_indices = np.where(labels == class_idx)[0]
+        if len(class_indices) > 0:
+            selected_indices = np.random.choice(
+                class_indices, 
+                size=min(samples_per_class, len(class_indices)), 
+                replace=False
+            )
+            balanced_indices.extend(selected_indices)
+    
+    # 선택된 인덱스로 데이터 필터링
+    embeddings = embeddings[balanced_indices]
+    labels = labels[balanced_indices]
+    
+    # DataFrame 생성
     df = pd.DataFrame({
         'Dimension 1': embeddings[:, 0],
         'Dimension 2': embeddings[:, 1],
-        'Emotion': [emotion_classes[label] for label in labels]  # 이미 정수로 변환된 레이블 사용
+        'Emotion': [emotion_classes[label] for label in labels]
     })
     
     # 메인 산점도
@@ -244,12 +253,12 @@ def visualize_embeddings(embeddings, labels=None, epoch=0, log_dir='logs', max_s
         x='Dimension 1',
         y='Dimension 2',
         hue='Emotion',
+        style='Emotion',  # 각 감정별로 다른 마커 스타일 사용
         palette='deep',
         alpha=0.7,
         s=100
     )
     
-    # 범례 위치 조정 및 스타일 개선
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', title='Emotion Class')
     plt.title(f"Text Embeddings by Emotion (Epoch {epoch})")
     
@@ -271,7 +280,6 @@ def visualize_embeddings(embeddings, labels=None, epoch=0, log_dir='logs', max_s
     image = image.convert('RGB')
     image_tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1).float() / 255.0
     
-    # 로컬 파일로도 저장
     plt.savefig(os.path.join(log_dir, f'embeddings_by_emotion_epoch_{epoch}.png'), 
                 bbox_inches='tight', dpi=300)
     plt.close()
@@ -375,6 +383,18 @@ def print_gpu_memory():
 last_batch_embeddings = None
 last_batch_emotions = None  # text 대신 emotions로 변경
 
+# 클래스별 시각화를 위한 변수 추가
+emotion_classes = ["joy", "fear", "anger", "sadness", "disgust", "shame", "guilt"]
+last_visualized_emotions = set()  # 마지막으로 시각화된 감정들 추적
+
+# 클래스별 시각화를 위한 데이터 수집 변수 추가
+class_visualization_data = {
+    'texts': [],
+    'slots': [],
+    'attns': [],
+    'labels': []
+}
+
 for epoch in range(start_epoch, args.epochs):
     model.train()
     if args.data_type == 'isear':
@@ -458,29 +478,67 @@ for epoch in range(start_epoch, args.epochs):
 
             # 텍스트 데이터의 경우 시각화 추가
             if args.data_type == 'isear':
-                # 배치에서 첫 번째 샘플만 시각화
-                slots_data = (model.module if args.use_dp else model).text_encoder.sysbinder(
-                    text_embeddings[0].unsqueeze(0).unsqueeze(0)
-                )[0]
-                
-                # debug print를 조건부로 실행
-                if args.debug_print:
-                    print(f"Attention weights shape: {attns[0].shape}")
-                    print(f"Attention weights values:\n{attns[0].detach().cpu().numpy()}")
-                    print(f"Slots shape: {slots_data.shape}")
-                
-                log_text_visualizations(
-                    writer=writer,
-                    epoch=epoch * len(train_loader) + batch_idx,
-                    text=text_data[0],
-                    text_embedding=text_embeddings[0],
-                    slots=slots_data,
-                    attns=attns[0].unsqueeze(0),
-                    reconstructed_embedding=recon_dvae[0],
-                    num_blocks=args.num_blocks,
-                    tag_prefix='train',
-                    debug=args.debug_print
-                )
+                # 배치 내의 모든 샘플에 대해 처리
+                for sample_idx in range(len(text_data)):
+                    # 감정 레이블 가져오기
+                    emotion_idx = torch.argmax(emotion_labels[sample_idx]).item()
+                    emotion_label = emotion_classes[emotion_idx]
+                    
+                    # 아직 시각화되지 않은 감정 클래스이거나 디버그 모드인 경우에만 시각화
+                    if emotion_label not in last_visualized_emotions or args.debug:
+                        slots_data = (model.module if args.use_dp else model).text_encoder.sysbinder(
+                            text_embeddings[sample_idx].unsqueeze(0).unsqueeze(0)
+                        )[0]
+                        
+                        # 클래스별 비교를 위한 데이터 수집
+                        if emotion_label not in [label for label in class_visualization_data['labels']]:
+                            class_visualization_data['texts'].append(text_data[sample_idx])
+                            class_visualization_data['slots'].append(slots_data)
+                            class_visualization_data['attns'].append(attns[sample_idx])
+                            class_visualization_data['labels'].append(emotion_label)
+                        
+                        # debug print를 조건부로 실행
+                        if args.debug_print:
+                            print(f"Processing emotion: {emotion_label}")
+                            print(f"Text: {text_data[sample_idx]}")
+                            print(f"Attention weights shape: {attns[sample_idx].shape}")
+                            print(f"Slots shape: {slots_data.shape}")
+                        
+                        log_text_visualizations(
+                            writer=writer,
+                            epoch=epoch * len(train_loader) + batch_idx,
+                            text=text_data[sample_idx],
+                            text_embedding=text_embeddings[sample_idx],
+                            slots=slots_data,
+                            attns=attns[sample_idx].unsqueeze(0),
+                            reconstructed_embedding=recon_dvae[sample_idx],
+                            emotion_label=emotion_label,
+                            num_blocks=args.num_blocks,
+                            tag_prefix='train',
+                            debug=args.debug_print
+                        )
+                        
+                        last_visualized_emotions.add(emotion_label)
+                    
+                    # 모든 감정 클래스가 시각화되었다면 클래스별 비교 시각화 생성
+                    if len(last_visualized_emotions) == len(emotion_classes):
+                        comparison_fig = visualize_class_comparison(
+                            texts=class_visualization_data['texts'],
+                            slots_list=class_visualization_data['slots'],
+                            attns_list=class_visualization_data['attns'],
+                            emotion_labels=class_visualization_data['labels'],
+                            num_blocks=args.num_blocks
+                        )
+                        writer.add_figure('train/class_comparison', comparison_fig, epoch)
+                        
+                        # 데이터 초기화
+                        last_visualized_emotions.clear()
+                        class_visualization_data = {
+                            'texts': [],
+                            'slots': [],
+                            'attns': [],
+                            'labels': []
+                        }
             else:
                 # 이미지 데이터의 경우 기존 시각화 유지
                 writer.add_image('train/original', vutils.make_grid(images[:8]), epoch * len(train_loader) + batch_idx)
