@@ -1,8 +1,12 @@
 import os
 import math
 import argparse
+import io
+from PIL import Image
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from torch.optim import Adam
 
@@ -17,8 +21,58 @@ import torchvision.utils as vutils
 from datetime import datetime
 
 from sysbinder import SysBinderImageAutoEncoder
-from data import GlobDataset
+from data import GlobDataset, EmotionTextDataset
 from utils import linear_warmup, cosine_anneal
+
+from transformers import AutoTokenizer, AutoModel
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# 텍스트 임베딩 모델 초기화
+text_tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+text_embedding_model = AutoModel.from_pretrained('bert-base-uncased')
+
+# 텍스트 임베딩 함수
+def embed_text(text):
+    inputs = text_tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+    outputs = text_embedding_model(**inputs)
+    return outputs.last_hidden_state.mean(dim=1)  # 평균 풀링
+
+# 텍스트 프로세서 클래스
+class TextProcessor(nn.Module):
+    def __init__(self, embedding_dim, hidden_size):
+        super().__init__()
+        self.fc = nn.Linear(embedding_dim, hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.ReLU(),
+            nn.Linear(hidden_size * 4, hidden_size)
+        )
+
+    def forward(self, text_embedding):
+        x = self.fc(text_embedding)
+        x = self.norm(x)
+        x = self.mlp(x)
+        return x
+
+# 시각화 함수
+def visualize_embeddings(embeddings, labels=None, epoch=0, log_dir='logs'):
+    sns.set(style="whitegrid")
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(x=embeddings[:, 0], y=embeddings[:, 1], hue=labels, palette="deep")
+    plt.title("Text Embeddings Visualization")
+    
+    # 이미지로 저장
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    image = Image.open(buf)
+    image.save(os.path.join(log_dir, f'embeddings_epoch_{epoch}.png'))
+    plt.close()
+    
+    return image
 
 parser = argparse.ArgumentParser()
 
@@ -38,7 +92,7 @@ parser.add_argument('--lr_dec', type=float, default=3e-4)
 parser.add_argument('--lr_warmup_steps', type=int, default=30000)
 parser.add_argument('--lr_half_life', type=int, default=250000)
 parser.add_argument('--clip', type=float, default=0.05)
-parser.add_argument('--epochs', type=int, default=500)
+parser.add_argument('--epochs', type=int, default=10)
 
 parser.add_argument('--num_iterations', type=int, default=3)
 parser.add_argument('--num_slots', type=int, default=4)
@@ -59,6 +113,9 @@ parser.add_argument('--tau_final', type=float, default=0.1)
 parser.add_argument('--tau_steps', type=int, default=30000)
 
 parser.add_argument('--use_dp', default=True, action='store_true')
+
+parser.add_argument('--data_type', type=str, choices=['clevr', 'isear'], default='clevr',
+                    help='데이터 종류 선택: clevr 또는 isear')
 
 args = parser.parse_args()
 
@@ -87,8 +144,21 @@ def visualize(image, recon_dvae, recon_tf, attns, N=8):
     return grid
 
 
-train_dataset = GlobDataset(root=args.data_path, phase='train', img_size=args.image_size)
-val_dataset = GlobDataset(root=args.data_path, phase='val', img_size=args.image_size)
+# 데이터셋 로드
+if args.data_type == 'clevr':
+    train_dataset = GlobDataset(root=args.data_path, phase='train', img_size=args.image_size)
+    val_dataset = GlobDataset(root=args.data_path, phase='val', img_size=args.image_size)
+else:
+    train_dataset = EmotionTextDataset(
+        csv_path='path/to/text.csv',
+        tokenizer=text_tokenizer,
+        phase='train'
+    )
+    val_dataset = EmotionTextDataset(
+        csv_path='path/to/text.csv',
+        tokenizer=text_tokenizer,
+        phase='val'
+    )
 
 train_sampler = None
 val_sampler = None
@@ -135,11 +205,28 @@ optimizer = Adam([
 if checkpoint is not None:
     optimizer.load_state_dict(checkpoint['optimizer'])
 
+# 텍스트 데이터셋 로드
+# text_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+
+# 텍스트 프로세서 초기화
+if args.data_type == 'isear':
+    text_processor = TextProcessor(embedding_dim=768, hidden_size=args.slot_size)
+
 for epoch in range(start_epoch, args.epochs):
     model.train()
+    if args.data_type == 'isear':
+        text_processor.train()
     
-    for batch, image in enumerate(train_loader):
-        global_step = epoch * train_epoch_size + batch
+    for batch_idx, batch in enumerate(train_loader):
+        if args.data_type == 'clevr':
+            images = batch.cuda()
+        elif args.data_type == 'isear':
+            text_data = batch['text']
+            text_embeddings = torch.stack([embed_text(text) for text in text_data])
+            processed_embeddings = text_processor(text_embeddings)
+            images = processed_embeddings  # 텍스트 임베딩을 이미지와 동일한 변수로 사용
+
+        global_step = epoch * train_epoch_size + batch_idx
 
         tau = cosine_anneal(
             global_step,
@@ -168,11 +255,9 @@ for epoch in range(start_epoch, args.epochs):
         optimizer.param_groups[1]['lr'] = lr_decay_factor * lr_warmup_factor_enc * args.lr_enc
         optimizer.param_groups[2]['lr'] = lr_decay_factor * lr_warmup_factor_dec * args.lr_dec
 
-        image = image.cuda()
-
         optimizer.zero_grad()
         
-        (recon_dvae, cross_entropy, mse, attns) = model(image, tau)
+        (recon_dvae, cross_entropy, mse, attns) = model(images, tau)
 
         if args.use_dp:
             mse = mse.mean()
@@ -187,9 +272,9 @@ for epoch in range(start_epoch, args.epochs):
         optimizer.step()
         
         with torch.no_grad():
-            if batch % log_interval == 0:
+            if batch_idx % log_interval == 0:
                 print('Train Epoch: {:3} [{:5}/{:5}] \t Loss: {:F} \t MSE: {:F}'.format(
-                      epoch+1, batch, train_epoch_size, loss.item(), mse.item()))
+                      epoch+1, batch_idx, train_epoch_size, loss.item(), mse.item()))
                 
                 writer.add_scalar('TRAIN/loss', loss.item(), global_step)
                 writer.add_scalar('TRAIN/cross_entropy', cross_entropy.item(), global_step)
@@ -200,11 +285,18 @@ for epoch in range(start_epoch, args.epochs):
                 writer.add_scalar('TRAIN/lr_enc', optimizer.param_groups[1]['lr'], global_step)
                 writer.add_scalar('TRAIN/lr_dec', optimizer.param_groups[2]['lr'], global_step)
 
+        # 텍스트 데이터에 대한 추가 시각화
+        if args.data_type == 'isear':
+            embedding_image = visualize_embeddings(processed_embeddings.detach().numpy(), epoch=epoch, log_dir=log_dir)
+            writer.add_image('TEXT/embeddings_epoch={:03}'.format(epoch+1), vutils.make_grid(embedding_image))
+            writer.add_scalar('TEXT/loss', loss.item(), epoch)
+
     with torch.no_grad():
-        recon_tf = (model.module if args.use_dp else model).reconstruct_autoregressive(image[:8])
-        grid = visualize(image, recon_dvae, recon_tf, attns, N=8)
-        writer.add_image('TRAIN_recons/epoch={:03}'.format(epoch+1), grid)
-    
+        if args.data_type == 'clevr':
+            recon_tf = (model.module if args.use_dp else model).reconstruct_autoregressive(images[:8])
+            grid = visualize(images, recon_dvae, recon_tf, attns, N=8)
+            writer.add_image('TRAIN_recons/epoch={:03}'.format(epoch+1), grid)
+
     with torch.no_grad():
         model.eval()
 
@@ -212,16 +304,17 @@ for epoch in range(start_epoch, args.epochs):
         val_mse = 0.
 
         for batch, image in enumerate(val_loader):
-            image = image.cuda()
+            if args.data_type == 'clevr':
+                image = image.cuda()
 
-            (recon_dvae, cross_entropy, mse, attns) = model(image, tau)
+                (recon_dvae, cross_entropy, mse, attns) = model(image, tau)
 
-            if args.use_dp:
-                mse = mse.mean()
-                cross_entropy = cross_entropy.mean()
+                if args.use_dp:
+                    mse = mse.mean()
+                    cross_entropy = cross_entropy.mean()
 
-            val_cross_entropy += cross_entropy.item()
-            val_mse += mse.item()
+                val_cross_entropy += cross_entropy.item()
+                val_mse += mse.item()
 
         val_cross_entropy /= (val_epoch_size)
         val_mse /= (val_epoch_size)
