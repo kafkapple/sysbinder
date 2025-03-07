@@ -216,56 +216,76 @@ class SysBinderImageAutoEncoder(nn.Module):
 
     def forward(self, image, tau):
         """
-        image: B, C, H, W
+        image: B, C, H, W (이미지의 경우) 또는 B, D (텍스트 임베딩의 경우)
         tau: float
         """
-        B, C, H, W = image.size()
+        if len(image.size()) == 4:  # 이미지 입력의 경우
+            B, C, H, W = image.size()
 
-        # dvae encode
-        z_logits = F.log_softmax(self.dvae.encoder(image), dim=1)  # B, vocab_size, H_enc, W_enc
-        z_soft = gumbel_softmax(z_logits, tau, False, dim=1)  # B, vocab_size, H_enc, W_enc
-        z_hard = gumbel_softmax(z_logits, tau, True, dim=1).detach()  # B, vocab_size, H_enc, W_enc
-        z_hard = z_hard.permute(0, 2, 3, 1).flatten(start_dim=1, end_dim=2)  # B, H_enc * W_enc, vocab_size
-        z_emb = self.image_decoder.dict(z_hard)  # B, H_enc * W_enc, d_model
-        z_emb = torch.cat([self.image_decoder.bos.expand(B, -1, -1), z_emb], dim=1)  # B, 1 + H_enc * W_enc, d_model
-        z_emb = self.image_decoder.decoder_pos(z_emb)  # B, 1 + H_enc * W_enc, d_model
+            # dvae encode
+            z_logits = F.log_softmax(self.dvae.encoder(image), dim=1)  # B, vocab_size, H_enc, W_enc
+            z_soft = gumbel_softmax(z_logits, tau, False, dim=1)  # B, vocab_size, H_enc, W_enc
+            z_hard = gumbel_softmax(z_logits, tau, True, dim=1).detach()  # B, vocab_size, H_enc, W_enc
+            z_hard = z_hard.permute(0, 2, 3, 1).flatten(start_dim=1, end_dim=2)  # B, H_enc * W_enc, vocab_size
+            z_emb = self.image_decoder.dict(z_hard)  # B, H_enc * W_enc, d_model
+            z_emb = torch.cat([self.image_decoder.bos.expand(B, -1, -1), z_emb], dim=1)  # B, 1 + H_enc * W_enc, d_model
+            z_emb = self.image_decoder.decoder_pos(z_emb)  # B, 1 + H_enc * W_enc, d_model
 
-        # dvae recon
-        dvae_recon = self.dvae.decoder(z_soft).reshape(B, C, H, W)  # B, C, H, W
-        dvae_mse = ((image - dvae_recon) ** 2).sum() / B  # 1
+            # dvae recon
+            dvae_recon = self.dvae.decoder(z_soft).reshape(B, C, H, W)  # B, C, H, W
+            dvae_mse = ((image - dvae_recon) ** 2).sum() / B  # 1
 
-        # sysbinder
-        emb = self.image_encoder.cnn(image)  # B, cnn_hidden_size, H, W
-        emb = self.image_encoder.pos(emb)  # B, cnn_hidden_size, H, W
-        H_enc, W_enc = emb.shape[-2:]
+            # sysbinder
+            emb = self.image_encoder.cnn(image)  # B, cnn_hidden_size, H, W
+            emb = self.image_encoder.pos(emb)  # B, cnn_hidden_size, H, W
+            H_enc, W_enc = emb.shape[-2:]
 
-        emb_set = emb.permute(0, 2, 3, 1).flatten(start_dim=1, end_dim=2)  # B, H * W, cnn_hidden_size
-        emb_set = self.image_encoder.mlp(self.image_encoder.layer_norm(emb_set))  # B, H * W, cnn_hidden_size
-        emb_set = emb_set.reshape(B, H_enc * W_enc, self.d_model)  # B, H * W, cnn_hidden_size
+            emb_set = emb.permute(0, 2, 3, 1).flatten(start_dim=1, end_dim=2)  # B, H * W, cnn_hidden_size
+            emb_set = self.image_encoder.mlp(self.image_encoder.layer_norm(emb_set))  # B, H * W, cnn_hidden_size
+            emb_set = emb_set.reshape(B, H_enc * W_enc, self.d_model)  # B, H * W, cnn_hidden_size
 
-        slots, attns = self.image_encoder.sysbinder(emb_set)  # slots: B, num_slots, slot_size
-                                                              # attns: B, num_slots, num_inputs
+            slots, attns = self.image_encoder.sysbinder(emb_set)  # slots: B, num_slots, slot_size
+                                                                  # attns: B, num_slots, num_inputs
 
-        attns = attns\
-            .transpose(-1, -2)\
-            .reshape(B, self.num_slots, 1, H_enc, W_enc)\
-            .repeat_interleave(H // H_enc, dim=-2)\
-            .repeat_interleave(W // W_enc, dim=-1)  # B, num_slots, 1, H, W
-        attns = image.unsqueeze(1) * attns + (1. - attns)  # B, num_slots, C, H, W
+            attns = attns\
+                .transpose(-1, -2)\
+                .reshape(B, self.num_slots, 1, H_enc, W_enc)\
+                .repeat_interleave(H // H_enc, dim=-2)\
+                .repeat_interleave(W // W_enc, dim=-1)  # B, num_slots, 1, H, W
+            attns = image.unsqueeze(1) * attns + (1. - attns)  # B, num_slots, C, H, W
 
-        # block coupling
+        else:  # 텍스트 임베딩의 경우
+            B, D = image.size()
+            
+            # 텍스트 임베딩을 d_model 차원으로 변환
+            emb_set = image.unsqueeze(1)  # B, 1, D
+            
+            # sysbinder를 통한 처리
+            slots, attns = self.image_encoder.sysbinder(emb_set)  # slots: B, num_slots, slot_size
+                                                                 # attns: B, num_slots, 1
+            
+            # 텍스트의 경우 reconstruction loss 대신 identity mapping loss 사용
+            dvae_recon = image  # 원본 텍스트 임베딩 반환
+            dvae_mse = torch.tensor(0.0, device=image.device)  # 텍스트의 경우 MSE 없음
+
+        # block coupling (이미지와 텍스트 모두 동일하게 처리)
         slots = self.image_decoder.slot_proj(slots)  # B, num_slots, num_blocks * d_model
         slots = slots + self.image_decoder.block_pos_proj(self.image_decoder.block_pos)  # B, num_slots, num_blocks * d_model
         slots = slots.reshape(B, self.num_slots, self.num_blocks, -1)  # B, num_slots, num_blocks, d_model
         slots = self.image_decoder.block_coupler(slots.flatten(end_dim=1))  # B * num_slots, num_blocks, d_model
         slots = slots.reshape(B, self.num_slots * self.num_blocks, -1)  # B, num_slots * num_blocks, d_model
 
-        # decode
-        pred = self.image_decoder.tf(z_emb[:, :-1], slots)   # B, H_enc * W_enc, d_model
-        pred = self.image_decoder.head(pred)  # B, H_enc * W_enc, vocab_size
-        cross_entropy = -(z_hard * torch.log_softmax(pred, dim=-1)).sum() / B  # 1
+        if len(image.size()) == 4:  # 이미지 입력의 경우
+            # decode
+            pred = self.image_decoder.tf(z_emb[:, :-1], slots)   # B, H_enc * W_enc, d_model
+            pred = self.image_decoder.head(pred)  # B, H_enc * W_enc, vocab_size
+            cross_entropy = -(z_hard * torch.log_softmax(pred, dim=-1)).sum() / B  # 1
+        else:  # 텍스트 임베딩의 경우
+            # 텍스트의 경우 cross entropy 대신 L2 loss 사용
+            pred = slots.mean(dim=1)  # B, d_model
+            cross_entropy = F.mse_loss(pred, image)
 
-        return (dvae_recon.clamp(0., 1.),
+        return (dvae_recon.clamp(0., 1.) if len(image.size()) == 4 else dvae_recon,
                 cross_entropy,
                 dvae_mse,
                 attns)
@@ -339,3 +359,118 @@ class SysBinderImageAutoEncoder(nn.Module):
         recon_transformer = recon_transformer.reshape(B, C, H, W)
 
         return recon_transformer
+
+
+class SysBinderTextAutoEncoder(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        
+        self.num_iterations = args.num_iterations
+        self.num_slots = args.num_slots
+        self.slot_size = args.slot_size
+        self.mlp_hidden_size = args.mlp_hidden_size
+        self.num_prototypes = args.num_prototypes
+        self.d_model = args.d_model
+        self.num_blocks = args.num_blocks
+
+        # Text Encoder (sysbinder 기반)
+        self.text_encoder = nn.ModuleDict({
+            'layer_norm': nn.LayerNorm(args.d_model),
+            'mlp': nn.Sequential(
+                linear(args.d_model, args.d_model, weight_init='kaiming'),
+                nn.ReLU(),
+                linear(args.d_model, args.d_model)
+            ),
+            'sysbinder': SysBinder(
+                args.num_iterations, args.num_slots,
+                args.d_model, args.slot_size, args.mlp_hidden_size,
+                args.num_prototypes, args.num_blocks
+            )
+        })
+
+        # Text Decoder
+        self.text_decoder = nn.ModuleDict({
+            'slot_proj': BlockLinear(args.slot_size, args.d_model * args.num_blocks, args.num_blocks),
+            'block_pos_proj': nn.Sequential(
+                BlockLinear(args.d_model * args.num_blocks, args.d_model * args.num_blocks, args.num_blocks),
+                nn.ReLU(),
+                BlockLinear(args.d_model * args.num_blocks, args.d_model * args.num_blocks, args.num_blocks)
+            ),
+            'block_coupler': TransformerEncoder(num_blocks=1, d_model=args.d_model, num_heads=4)
+        })
+        
+        # Parameters
+        self.block_pos = nn.Parameter(torch.zeros(1, 1, args.d_model * args.num_blocks))
+        nn.init.normal_(self.block_pos, std=0.02)  # 초기화 추가
+
+    def forward(self, text_embedding, tau=None):
+        """
+        text_embedding: B, D (텍스트 임베딩)
+        tau: float (not used for text, kept for API compatibility)
+        """
+        # 입력 텍스트 임베딩의 차원 처리
+        if len(text_embedding.size()) > 2:
+            B = text_embedding.size(0)
+            text_embedding = text_embedding.view(B, -1)  # 배치 차원을 제외한 나머지 차원을 펼침
+        else:
+            B = text_embedding.size(0)
+        
+        # 텍스트 임베딩 전처리
+        emb_set = text_embedding.unsqueeze(1)  # B, 1, D
+        emb_set = self.text_encoder['mlp'](self.text_encoder['layer_norm'](emb_set))
+        
+        # Sysbinder를 통한 처리
+        slots, attns = self.text_encoder['sysbinder'](emb_set)  # slots: B, num_slots, slot_size
+                                                               # attns: B, num_slots, 1
+        
+        # Block coupling
+        slots = self.text_decoder['slot_proj'](slots)  # B, num_slots, num_blocks * d_model
+        slots = slots + self.text_decoder['block_pos_proj'](self.block_pos)
+        slots = slots.reshape(B, self.num_slots, self.num_blocks, -1)  # B, num_slots, num_blocks, d_model
+        slots = self.text_decoder['block_coupler'](slots.flatten(end_dim=1))
+        slots = slots.reshape(B, self.num_slots * self.num_blocks, -1)
+        
+        # 최종 출력 생성
+        pred = slots.mean(dim=1)  # B, d_model
+        
+        # Reconstruction loss (L2 loss)
+        recon_loss = F.mse_loss(pred, text_embedding)
+        
+        # MSE 계산 - 텍스트 임베딩 공간에서의 재구성 오차
+        mse = ((text_embedding - pred) ** 2).sum() / B
+        
+        return (text_embedding,  # 원본 임베딩 반환 (reconstruction)
+                recon_loss,      # reconstruction loss
+                mse,            # MSE loss
+                attns)           # attention maps
+
+    def encode(self, text_embedding):
+        """
+        text_embedding: B, D
+        """
+        B, D = text_embedding.size()
+        
+        # 텍스트 임베딩 전처리
+        emb_set = text_embedding.unsqueeze(1)
+        emb_set = self.text_encoder['mlp'](self.text_encoder['layer_norm'](emb_set))
+        
+        # Sysbinder를 통한 처리
+        slots, attns = self.text_encoder['sysbinder'](emb_set)
+        
+        return slots, text_embedding.unsqueeze(1), attns  # attns_vis는 원본 임베딩 반환
+
+    def decode(self, slots):
+        """
+        slots: B, N, slot_size
+        """
+        B, num_slots, slot_size = slots.size()
+        
+        # Block coupling
+        slots = self.text_decoder['slot_proj'](slots)
+        slots = slots + self.text_decoder['block_pos_proj'](self.block_pos)
+        slots = slots.reshape(B, num_slots, self.num_blocks, -1)
+        slots = self.text_decoder['block_coupler'](slots.flatten(end_dim=1))
+        slots = slots.reshape(B, self.num_slots * self.num_blocks, -1)
+        
+        # 최종 출력 생성
+        return slots.mean(dim=1)  # B, d_model

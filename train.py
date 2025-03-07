@@ -20,7 +20,7 @@ import torchvision.utils as vutils
 
 from datetime import datetime
 
-from sysbinder import SysBinderImageAutoEncoder
+from sysbinder import SysBinderImageAutoEncoder, SysBinderTextAutoEncoder
 from data import GlobDataset, EmotionTextDataset
 from utils import linear_warmup, cosine_anneal
 
@@ -46,19 +46,17 @@ def embed_text(text):
 class TextProcessor(nn.Module):
     def __init__(self, embedding_dim, hidden_size):
         super().__init__()
-        self.fc = nn.Linear(embedding_dim, hidden_size)
-        self.norm = nn.LayerNorm(hidden_size)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
+        # BERT 임베딩을 모델 차원으로 변환하는 프로젝션 레이어들
+        self.projection = nn.Sequential(
+            nn.Linear(embedding_dim, 1024),  # 768 -> 1024
+            nn.LayerNorm(1024),
             nn.ReLU(),
-            nn.Linear(hidden_size * 4, hidden_size)
+            nn.Linear(1024, hidden_size),    # 1024 -> slot_size (2048)
+            nn.LayerNorm(hidden_size)
         )
-
+        
     def forward(self, text_embedding):
-        x = self.fc(text_embedding)
-        x = self.norm(x)
-        x = self.mlp(x)
-        return x
+        return self.projection(text_embedding)
 
 # 시각화 함수
 def visualize_embeddings(embeddings, labels=None, epoch=0, log_dir='logs'):
@@ -86,7 +84,7 @@ parser.add_argument('--image_size', type=int, default=128)
 parser.add_argument('--image_channels', type=int, default=3)
 
 parser.add_argument('--checkpoint_path', default='checkpoint.pt.tar')
-parser.add_argument('--data_path', default='./data/clevr-easy/train/*.png') 
+parser.add_argument('--data_path', default='data/isear/isear.csv') #clevr-easy/train/*.png') 
 parser.add_argument('--log_path', default='logs/')
 
 parser.add_argument('--lr_dvae', type=float, default=3e-4)
@@ -95,7 +93,7 @@ parser.add_argument('--lr_dec', type=float, default=3e-4)
 parser.add_argument('--lr_warmup_steps', type=int, default=30000)
 parser.add_argument('--lr_half_life', type=int, default=250000)
 parser.add_argument('--clip', type=float, default=0.05)
-parser.add_argument('--epochs', type=int, default=10)
+parser.add_argument('--epochs', type=int, default=1)
 
 parser.add_argument('--num_iterations', type=int, default=3)
 parser.add_argument('--num_slots', type=int, default=4)
@@ -108,7 +106,7 @@ parser.add_argument('--num_prototypes', type=int, default=64)
 parser.add_argument('--vocab_size', type=int, default=4096)
 parser.add_argument('--num_decoder_layers', type=int, default=8)
 parser.add_argument('--num_decoder_heads', type=int, default=4)
-parser.add_argument('--d_model', type=int, default=192)
+parser.add_argument('--d_model', type=int, default=768)
 parser.add_argument('--dropout', type=int, default=0.1)
 
 parser.add_argument('--tau_start', type=float, default=1.0)
@@ -116,8 +114,7 @@ parser.add_argument('--tau_final', type=float, default=0.1)
 parser.add_argument('--tau_steps', type=int, default=30000)
 
 parser.add_argument('--use_dp', default=True, action='store_true')
-
-parser.add_argument('--data_type', type=str, choices=['clevr', 'isear'], default='clevr',
+parser.add_argument('--data_type', type=str, choices=['clevr', 'isear'], default='isear',
                     help='데이터 종류 선택: clevr 또는 isear')
 
 args = parser.parse_args()
@@ -153,16 +150,13 @@ if args.data_type == 'clevr':
     val_dataset = GlobDataset(root=args.data_path, phase='val', img_size=args.image_size)
 else:
     # ISEAR 데이터셋 로드
-    isear_df = pd.read_csv('data/isear/isear.csv')
-    train_df, val_df = train_test_split(isear_df, test_size=0.2, random_state=args.seed)  # 80% train, 20% val
-    
     train_dataset = EmotionTextDataset(
-        dataframe=train_df,
+        csv_path=args.data_path,
         tokenizer=text_tokenizer,
         phase='train'
     )
     val_dataset = EmotionTextDataset(
-        dataframe=val_df,
+        csv_path=args.data_path,
         tokenizer=text_tokenizer,
         phase='val'
     )
@@ -186,7 +180,11 @@ val_epoch_size = len(val_loader)
 
 log_interval = train_epoch_size // 5
 
-model = SysBinderImageAutoEncoder(args)
+# 데이터 타입에 따라 적절한 모델 초기화
+if args.data_type == 'clevr':
+    model = SysBinderImageAutoEncoder(args)
+else:
+    model = SysBinderTextAutoEncoder(args)
 
 if os.path.isfile(args.checkpoint_path):
     checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
@@ -228,10 +226,11 @@ for epoch in range(start_epoch, args.epochs):
         if args.data_type == 'clevr':
             images = batch.cuda()
         elif args.data_type == 'isear':
+            # 텍스트 임베딩 생성
             text_data = batch['text']
             text_embeddings = torch.stack([embed_text(text) for text in text_data])
-            processed_embeddings = text_processor(text_embeddings)
-            images = processed_embeddings  # 텍스트 임베딩을 이미지와 동일한 변수로 사용
+            text_embeddings = text_embeddings.view(text_embeddings.size(0), -1).cuda()  # 배치 차원을 제외한 나머지 차원을 펼침
+            images = text_embeddings  # 텍스트 임베딩을 images 변수에 할당
 
         global_step = epoch * train_epoch_size + batch_idx
 
@@ -292,17 +291,19 @@ for epoch in range(start_epoch, args.epochs):
                 writer.add_scalar('TRAIN/lr_enc', optimizer.param_groups[1]['lr'], global_step)
                 writer.add_scalar('TRAIN/lr_dec', optimizer.param_groups[2]['lr'], global_step)
 
-        # 텍스트 데이터에 대한 추가 시각화
-        if args.data_type == 'isear':
-            embedding_image = visualize_embeddings(processed_embeddings.detach().numpy(), epoch=epoch, log_dir=log_dir)
-            writer.add_image('TEXT/embeddings_epoch={:03}'.format(epoch+1), vutils.make_grid(embedding_image))
-            writer.add_scalar('TEXT/loss', loss.item(), epoch)
+        
 
     with torch.no_grad():
+        
         if args.data_type == 'clevr':
             recon_tf = (model.module if args.use_dp else model).reconstruct_autoregressive(images[:8])
             grid = visualize(images, recon_dvae, recon_tf, attns, N=8)
             writer.add_image('TRAIN_recons/epoch={:03}'.format(epoch+1), grid)
+        # 텍스트 데이터에 대한 추가 시각화
+        elif args.data_type == 'isear':
+            embedding_image = visualize_embeddings(processed_embeddings.detach().numpy(), epoch=epoch, log_dir=log_dir)
+            writer.add_image('TEXT/embeddings_epoch={:03}'.format(epoch+1), vutils.make_grid(embedding_image))
+            writer.add_scalar('TEXT/loss', loss.item(), epoch)
 
     with torch.no_grad():
         model.eval()

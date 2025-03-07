@@ -153,8 +153,22 @@ class EmotionTextDataset(Dataset):
         self.emotion_column = emotion_column
         self.emotion_classes = emotion_classes
         
+        # 감정 레이블 매핑 (ISEAR 데이터셋 기준)
+        self.emotion_mapping = {
+            '1': 'joy',
+            '2': 'fear',
+            '3': 'anger',
+            '4': 'sadness',
+            '5': 'disgust',
+            '6': 'shame',
+            '7': 'guilt'
+        }
+        
         # CSV 파일 로드
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(csv_path, sep='|', encoding='utf-8', on_bad_lines='skip')
+        
+        # 감정 레이블 변환
+        df[emotion_column] = df[emotion_column].astype(str).map(self.emotion_mapping)
         
         # 필요한 컬럼이 있는지 확인
         assert text_column in df.columns, f"{text_column} 컬럼이 없습니다."
