@@ -50,6 +50,26 @@ class LoggerWrapper:
         self.writer.add_text(tag, text_string, global_step)
         wandb.log({tag: text_string}, step=global_step)
     
+    def add_table(self, tag, dataframe, global_step=None):
+        """
+        Log pandas DataFrame as a table, safely handling any circular references
+        Args:
+            tag: Name of the table
+            dataframe: pandas DataFrame to log
+            global_step: Global step value
+        """
+        try:
+            # Convert DataFrame to markdown for better display
+            markdown_table = dataframe.to_markdown(index=False)
+            self.add_text(tag, markdown_table, global_step)
+        except Exception as e:
+            print(f"Warning: Failed to log table {tag} due to error: {str(e)}")
+            try:
+                # Fallback to simple string representation
+                self.add_text(f"{tag}", dataframe.to_string(), global_step)
+            except:
+                print(f"Warning: Also failed to log table as text for {tag}")
+    
     def close(self):
         """Close both loggers"""
         self.writer.close()

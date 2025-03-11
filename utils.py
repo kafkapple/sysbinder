@@ -1,4 +1,5 @@
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -10,6 +11,7 @@ import seaborn as sns
 from sklearn.decomposition import PCA
 import pandas as pd
 import textwrap
+import torchvision.utils as vutils
 
 
 def linear_warmup(step, start_value, final_value, start_step, final_step):
@@ -690,3 +692,185 @@ def log_text_visualizations(writer, epoch, text, text_embedding, slots, attns,
     # 3. Record numerical metrics
     cos_sim = F.cosine_similarity(reconstructed_embedding, text_embedding, dim=-1).mean()
     writer.add_scalar(f'{tag_prefix}/cosine_similarity_{emotion_label}', cos_sim, epoch)
+
+def plot_reconstruction_similarity_over_time(similarities_dict, save_path=None):
+    """
+    Plot reconstruction similarity scores over time for each emotion class
+    Args:
+        similarities_dict: Dictionary with emotion classes as keys and list of similarities as values
+        save_path: Path to save the plot
+    Returns:
+        matplotlib figure object
+    """
+    plt.figure(figsize=(12, 6))
+    
+    for emotion, similarities in similarities_dict.items():
+        epochs = range(1, len(similarities) + 1)
+        plt.plot(epochs, similarities, label=emotion, marker='o', markersize=3)
+    
+    plt.xlabel('Epoch')
+    plt.ylabel('Reconstruction Similarity')
+    plt.title('Text Embedding Reconstruction Quality Over Time')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight', dpi=300)
+    
+    return plt.gcf()
+
+def save_reconstruction_examples(original_texts, reconstructed_texts, emotion_labels, n_samples=5):
+    """
+    Save reconstruction examples to CSV and create a wandb Table
+    Args:
+        original_texts: List of original texts
+        reconstructed_texts: List of reconstructed texts
+        emotion_labels: List of emotion labels
+        n_samples: Number of samples per class
+    Returns:
+        pandas DataFrame and wandb Table
+    """
+    data = {
+        'Emotion': [],
+        'Original Text': [],
+        'Reconstructed Text': []
+    }
+    
+    # Group by emotion
+    emotion_groups = {}
+    for orig, recon, emotion in zip(original_texts, reconstructed_texts, emotion_labels):
+        if emotion not in emotion_groups:
+            emotion_groups[emotion] = []
+        emotion_groups[emotion].append((orig, recon))
+    
+    # Sample n examples per emotion
+    for emotion, examples in emotion_groups.items():
+        samples = examples[:n_samples]
+        for orig, recon in samples:
+            data['Emotion'].append(emotion)
+            data['Original Text'].append(orig)
+            data['Reconstructed Text'].append(recon)
+    
+    # Create DataFrame
+    df = pd.DataFrame(data)
+    return df
+
+def create_heatmap_animation(heatmaps_data, emotion_classes, num_slots, num_blocks):
+    """
+    Create animation from heatmaps for visualization over epochs
+    Args:
+        heatmaps_data: List of heatmaps per epoch
+        emotion_classes: List of emotion classes
+        num_slots: Number of slots
+        num_blocks: Number of blocks
+    Returns:
+        Animation figure
+    """
+    fig = plt.figure(figsize=(15, 10))
+    plt.clf()
+    
+    def update(frame):
+        plt.clf()
+        data = heatmaps_data[frame]
+        
+        n_emotions = len(emotion_classes)
+        n_cols = min(3, n_emotions)
+        n_rows = (n_emotions + n_cols - 1) // n_cols
+        
+        for idx, emotion in enumerate(emotion_classes):
+            ax = plt.subplot(n_rows, n_cols, idx + 1)
+            if emotion in data:
+                sns.heatmap(data[emotion], 
+                           xticklabels=range(1, num_blocks + 1),
+                           yticklabels=range(1, num_slots + 1),
+                           ax=ax)
+                ax.set_title(f'{emotion}')
+        
+        plt.suptitle(f'Epoch {frame + 1}')
+        plt.tight_layout()
+    
+    return fig, update
+
+def manipulate_blocks(model, input_data, block_idx, target_block=None, is_text=False):
+    """
+    Manipulate specific block in the representation and visualize/save results
+    Args:
+        model: SysBinder model
+        input_data: Input data (image or text)
+        block_idx: Index of block to manipulate
+        target_block: Target block values to replace with (optional)
+        is_text: Whether input is text data
+    Returns:
+        Original and manipulated outputs
+    """
+    with torch.no_grad():
+        # Get original representation
+        if is_text:
+            slots, _, attns = model.encode(input_data)
+            original_output = model.decode(slots)
+        else:
+            slots, attns_vis, attns = model.encode(input_data)
+            original_output = model.decode(slots)
+        
+        # Manipulate block
+        manipulated_slots = slots.clone()
+        if target_block is not None:
+            # Replace with target block
+            block_size = model.slot_size // model.num_blocks
+            start_idx = block_idx * block_size
+            end_idx = start_idx + block_size
+            manipulated_slots[..., start_idx:end_idx] = target_block
+        else:
+            # Zero out the block
+            block_size = model.slot_size // model.num_blocks
+            start_idx = block_idx * block_size
+            end_idx = start_idx + block_size
+            manipulated_slots[..., start_idx:end_idx] = 0
+        
+        # Get manipulated output
+        manipulated_output = model.decode(manipulated_slots)
+        
+        return {
+            'original': original_output,
+            'manipulated': manipulated_output,
+            'slots': slots,
+            'manipulated_slots': manipulated_slots,
+            'attns': attns
+        }
+
+def save_block_manipulation_results(results, save_dir, is_text=False):
+    """
+    Save block manipulation results
+    Args:
+        results: Dictionary containing manipulation results
+        save_dir: Directory to save results
+        is_text: Whether results are text data
+    """
+    if is_text:
+        # Save as CSV
+        data = {
+            'Original': results['original'].cpu().numpy(),
+            'Manipulated': results['manipulated'].cpu().numpy(),
+            'Block_Attention': results['attns'].cpu().numpy().mean(axis=1)
+        }
+        df = pd.DataFrame(data)
+        df.to_csv(os.path.join(save_dir, 'block_manipulation_results.csv'), index=False)
+    else:
+        # Save as images
+        vutils.save_image(results['original'], 
+                         os.path.join(save_dir, 'original.png'))
+        vutils.save_image(results['manipulated'],
+                         os.path.join(save_dir, 'manipulated.png'))
+        
+        # Save attention maps
+        attention_fig = plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1)
+        plt.imshow(results['attns'][0].mean(0).cpu())
+        plt.title('Original Attention')
+        plt.subplot(1, 2, 2)
+        plt.imshow(results['attns'][1].mean(0).cpu())
+        plt.title('Manipulated Attention')
+        plt.savefig(os.path.join(save_dir, 'attention_maps.png'))
+        plt.close()
